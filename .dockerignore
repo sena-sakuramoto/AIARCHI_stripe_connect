@@ -1,0 +1,16 @@
+node_modules
+.git
+.env
+.env.*
+*.log
+stripe-cli*
+stripe.exe
+stripe-discord
+.DS_Store
+.fsevents*
+CLTMSI*
+.vscode
+.idea
+coverage
+npm-debug.log
+

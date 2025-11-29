@@ -1,0 +1,1410 @@
+'use strict';
+
+require('dotenv').config();
+const express = require('express');
+const crypto = require('crypto');
+const Stripe = require('stripe');
+const { Firestore } = require('@google-cloud/firestore');
+const { Client, GatewayIntentBits, Partials } = require('discord.js');
+
+// Discord招待リンクの既定値
+const DEFAULT_DISCORD_INVITE_URL = 'https://discord.gg/87fs9DxDyv';
+
+// ------- 環境変数の取得と整形 -------
+const CFG = {
+  STRIPE_MODE: process.env.STRIPE_MODE || 'test', // 'test' | 'live'
+
+  STRIPE_SECRET_KEY_TEST: process.env.STRIPE_SECRET_KEY_TEST || '',
+  STRIPE_WEBHOOK_SECRET_TEST: process.env.STRIPE_WEBHOOK_SECRET_TEST || '',
+  STRIPE_PRICE_ID_MONTHLY_TEST: process.env.STRIPE_PRICE_ID_MONTHLY_TEST || '',
+  STRIPE_PRICE_ID_YEARLY_TEST: process.env.STRIPE_PRICE_ID_YEARLY_TEST || '',
+  STRIPE_ADDITIONAL_PRICE_IDS_TEST: process.env.STRIPE_ADDITIONAL_PRICE_IDS_TEST || '',
+
+  STRIPE_SECRET_KEY_LIVE: process.env.STRIPE_SECRET_KEY_LIVE || '',
+  STRIPE_WEBHOOK_SECRET_LIVE: process.env.STRIPE_WEBHOOK_SECRET_LIVE || '',
+  STRIPE_PRICE_ID_MONTHLY_LIVE: process.env.STRIPE_PRICE_ID_MONTHLY_LIVE || '',
+  STRIPE_PRICE_ID_YEARLY_LIVE: process.env.STRIPE_PRICE_ID_YEARLY_LIVE || '',
+  STRIPE_ADDITIONAL_PRICE_IDS_LIVE: process.env.STRIPE_ADDITIONAL_PRICE_IDS_LIVE || '',
+
+  DISCORD_CLIENT_ID: process.env.DISCORD_CLIENT_ID || '',
+  DISCORD_CLIENT_SECRET: process.env.DISCORD_CLIENT_SECRET || '',
+  DISCORD_BOT_TOKEN: process.env.DISCORD_BOT_TOKEN || '',
+  DISCORD_GUILD_ID: process.env.DISCORD_GUILD_ID || '',
+  DISCORD_PRO_ROLE_ID: process.env.DISCORD_PRO_ROLE_ID || '',
+  DISCORD_GUILD_INVITE_URL: process.env.DISCORD_GUILD_INVITE_URL || DEFAULT_DISCORD_INVITE_URL,
+
+  OAUTH_STATE_SECRET: process.env.OAUTH_STATE_SECRET || '',
+  SCHEDULER_TOKEN: process.env.SCHEDULER_TOKEN || '',
+
+  GCP_PROJECT_ID: process.env.GCP_PROJECT_ID || process.env.PROJECT_ID || ''
+};
+
+function assertEnv() {
+  const required = [
+    'STRIPE_MODE',
+    'DISCORD_CLIENT_ID','DISCORD_CLIENT_SECRET','DISCORD_BOT_TOKEN',
+    'DISCORD_GUILD_ID','DISCORD_PRO_ROLE_ID','DISCORD_GUILD_INVITE_URL',
+    'OAUTH_STATE_SECRET','SCHEDULER_TOKEN'
+  ];
+  required.forEach(k => {
+    if (!CFG[k]) {
+      console.warn(`Missing ENV: ${k}`);
+    }
+  });
+}
+assertEnv();
+console.log('[config] Discord Guild Invite URL:', CFG.DISCORD_GUILD_INVITE_URL);
+
+// デバッグ: Discord Client Secretの確認
+console.log('[debug] Discord Client Secret loaded:', CFG.DISCORD_CLIENT_SECRET ? `${CFG.DISCORD_CLIENT_SECRET.substring(0, 4)}...` : 'MISSING');
+
+function modePick(testVal, liveVal) {
+  return CFG.STRIPE_MODE === 'live' ? liveVal : testVal;
+}
+
+function parsePriceList(value) {
+  if (!value) return [];
+  return value
+    .split(',')
+    .map(v => v.trim())
+    .filter(Boolean);
+}
+
+const STRIPE_SECRET_KEY = modePick(CFG.STRIPE_SECRET_KEY_TEST, CFG.STRIPE_SECRET_KEY_LIVE);
+const STRIPE_WEBHOOK_SECRET = modePick(CFG.STRIPE_WEBHOOK_SECRET_TEST, CFG.STRIPE_WEBHOOK_SECRET_LIVE);
+const PRICE_IDS = {
+  monthly: modePick(CFG.STRIPE_PRICE_ID_MONTHLY_TEST, CFG.STRIPE_PRICE_ID_MONTHLY_LIVE),
+  yearly: modePick(CFG.STRIPE_PRICE_ID_YEARLY_TEST, CFG.STRIPE_PRICE_ID_YEARLY_LIVE),
+  extra: modePick(
+    parsePriceList(CFG.STRIPE_ADDITIONAL_PRICE_IDS_TEST),
+    parsePriceList(CFG.STRIPE_ADDITIONAL_PRICE_IDS_LIVE)
+  )
+};
+
+const ENTITLED_PRICE_IDS = new Set([
+  PRICE_IDS.monthly,
+  PRICE_IDS.yearly,
+  ...PRICE_IDS.extra
+].filter(Boolean));
+
+if (ENTITLED_PRICE_IDS.size === 0) {
+  console.warn('[stripe] No entitled Price IDs configured.');
+} else {
+  console.log('[stripe] Entitled Price IDs:', Array.from(ENTITLED_PRICE_IDS));
+}
+
+// Stripeクライアント
+const stripe = new Stripe(STRIPE_SECRET_KEY);
+
+// Firestoreクライアント（ADC/ServiceAccount）
+let firestore;
+try {
+  firestore = new Firestore({ projectId: CFG.GCP_PROJECT_ID });
+  console.log('[firestore] Initialized successfully');
+} catch (err) {
+  console.error('[firestore] Initialization failed:', err);
+  firestore = null;
+}
+
+// Discordクライアント（最小Intent: Guilds + GuildMembers）
+const discord = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
+  partials: [Partials.GuildMember]
+});
+
+let discordReady = false;
+discord.once('ready', () => {
+  console.log(`[discord] Logged in as ${discord.user.tag}`);
+  discordReady = true;
+});
+
+if (CFG.DISCORD_BOT_TOKEN && CFG.DISCORD_BOT_TOKEN !== 'placeholder') {
+  discord.login(CFG.DISCORD_BOT_TOKEN).catch(err => {
+    console.error('Discord login failed:', err);
+    // Don't exit in production, just log the error
+    console.warn('Continuing without Discord bot...');
+  });
+} else {
+  console.warn('Discord bot token not configured, skipping login');
+}
+
+// ------- Express 構成 -------
+const app = express();
+const PORT = process.env.PORT || 8080;
+
+// Stripe Webhookは raw body が必要
+app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  let event;
+  try {
+    const sig = req.headers['stripe-signature'];
+    event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error('[webhook] signature verification failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  try {
+    switch (event.type) {
+      case 'checkout.session.completed': {
+        const session = event.data.object;
+        // code = session.id を success_url で渡す設計
+        await saveLinkCode(session.id, session.customer);
+        console.log(`[webhook] saved link code for session ${session.id}, customer ${session.customer}`);
+        break;
+      }
+      case 'customer.subscription.created': {
+        const sub = event.data.object;
+        await handleSubChange(sub);
+        await maybeMarkTrialUsed(sub);
+        break;
+      }
+      case 'customer.subscription.updated': {
+        const sub = event.data.object;
+        await handleSubChange(sub);
+        await maybeMarkTrialUsed(sub);
+        break;
+      }
+      case 'customer.subscription.deleted': {
+        const sub = event.data.object;
+        await handleSubChange(sub);
+        break;
+      }
+      default:
+        // 他イベントは無視でOK
+        break;
+    }
+    return res.json({ received: true });
+  } catch (err) {
+    console.error('[webhook] handler error:', err);
+    return res.status(500).send('webhook handler error');
+  }
+});
+
+// 一般JSONは通常のparser
+app.use(express.json());
+
+// ---- ヘルス & ルート ----
+app.get('/healthz', (_req, res) => res.send('ok'));
+
+app.get('/', (_req, res) => {
+  const html = `
+<!doctype html><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Discord Pro メンバーシップ</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: system-ui, -apple-system, "Noto Sans JP", sans-serif;
+    background: #f8f9fa;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #333;
+  }
+  .container {
+    max-width: 500px;
+    text-align: center;
+    padding: 48px 24px;
+    background: white;
+    border-radius: 8px;
+    border: 1px solid #e9ecef;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+  }
+  h1 { font-size: 2.2rem; margin-bottom: 16px; font-weight: 600; }
+  .subtitle { font-size: 1.1rem; color: #666; margin-bottom: 32px; }
+  .features { text-align: left; margin-bottom: 32px; }
+  .feature { display: flex; align-items: center; margin-bottom: 12px; font-size: 1rem; }
+  .feature::before { content: "•"; margin-right: 12px; color: #666; font-weight: bold; }
+  .btn {
+    display: inline-block;
+    padding: 14px 28px;
+    background: #fff;
+    color: #333;
+    text-decoration: none;
+    border-radius: 4px;
+    font-size: 1rem;
+    font-weight: 500;
+    margin: 8px;
+    border: 2px solid #333;
+    transition: all 0.2s ease;
+  }
+  .btn:hover {
+    background: #333;
+    color: #fff;
+  }
+  .btn.primary {
+    background: #333;
+    color: #fff;
+  }
+  .btn.primary:hover {
+    background: #000;
+  }
+  .cancel-section {
+    margin-top: 48px;
+    padding-top: 32px;
+    border-top: 1px solid #e9ecef;
+  }
+  .cancel-section h3 {
+    font-size: 1.1rem;
+    margin-bottom: 16px;
+    color: #666;
+  }
+  .mode-badge {
+    position: absolute;
+    top: 20px;
+    right: 20px;
+    padding: 6px 12px;
+    background: ${CFG.STRIPE_MODE === 'live' ? '#000' : '#666'};
+    color: white;
+    border-radius: 4px;
+    font-size: 0.8rem;
+    font-weight: 500;
+  }
+</style>
+<div class="mode-badge">${CFG.STRIPE_MODE === 'live' ? 'LIVE' : 'TEST'}</div>
+<div class="container">
+  <h1>Discord Pro</h1>
+  <p class="subtitle">プレミアムメンバーシップ</p>
+
+  <div class="features">
+    <div class="feature">Pro限定チャンネルアクセス</div>
+    <div class="feature">専用サポート</div>
+    <div class="feature">月額 ¥5,000</div>
+    <div class="feature">30日間無料トライアル</div>
+    <div class="feature">いつでも解約可能</div>
+  </div>
+
+  <form id="checkout-form" style="margin-bottom: 16px;">
+    <div style="margin-bottom: 16px;">
+      <label for="email-input" style="display: block; margin-bottom: 8px; font-weight: 500;">メールアドレス</label>
+      <input
+        type="email"
+        id="email-input"
+        placeholder="your@example.com"
+        required
+        style="width: 100%; padding: 12px 16px; border-radius: 4px; border: 1px solid #e9ecef; font-size: 1rem;"
+      >
+    </div>
+    <button type="submit" class="btn primary" id="checkout-btn">
+      今すぐ参加（30日間無料）
+    </button>
+    <div id="error-message" style="color: #dc3545; margin-top: 16px; display: none;"></div>
+    <div id="warning-message" style="color: #ff9800; margin-top: 16px; display: none;"></div>
+  </form>
+
+  <script>
+    document.getElementById('checkout-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+
+      const btn = document.getElementById('checkout-btn');
+      const email = document.getElementById('email-input').value;
+      const errorDiv = document.getElementById('error-message');
+      const warningDiv = document.getElementById('warning-message');
+
+      // リセット
+      errorDiv.style.display = 'none';
+      warningDiv.style.display = 'none';
+      btn.disabled = true;
+      btn.textContent = '処理中...';
+
+      try {
+        const response = await fetch('/api/create-checkout-session', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email })
+        });
+
+        const data = await response.json();
+
+        if (!response.ok) {
+          errorDiv.textContent = data.message || 'エラーが発生しました';
+          errorDiv.style.display = 'block';
+          btn.disabled = false;
+          btn.textContent = '今すぐ参加（30日間無料）';
+          return;
+        }
+
+        if (data.warnings && data.warnings.length > 0) {
+          warningDiv.textContent = data.warnings.join('\\n');
+          warningDiv.style.display = 'block';
+        }
+
+        // Stripe Checkoutページへリダイレクト
+        window.location.href = data.url;
+
+      } catch (error) {
+        errorDiv.textContent = 'ネットワークエラーが発生しました';
+        errorDiv.style.display = 'block';
+        btn.disabled = false;
+        btn.textContent = '今すぐ参加（30日間無料）';
+      }
+    });
+  </script>
+
+  <div class="cancel-section">
+    <h3>既存メンバー</h3>
+    <p style="margin-bottom: 16px; color: #666;">管理・解約はこちら</p>
+    <a class="btn" href="/portal-lookup">請求管理</a>
+  </div>
+</div>
+  `;
+  res.type('html').send(html);
+});
+
+// 解約・請求管理へのアクセスページ
+app.get('/portal-lookup', (req, res) => {
+  const html = `
+<!doctype html><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>サブスクリプション管理</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: system-ui, -apple-system, "Noto Sans JP", sans-serif;
+    background: #f8f9fa;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #333;
+  }
+  .container {
+    max-width: 500px;
+    text-align: center;
+    padding: 48px 24px;
+    background: white;
+    border-radius: 8px;
+    border: 1px solid #e9ecef;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+  }
+  h1 { font-size: 2rem; margin-bottom: 16px; font-weight: 600; }
+  .subtitle { font-size: 1rem; color: #666; margin-bottom: 32px; line-height: 1.6; }
+  .input-group { margin-bottom: 24px; text-align: left; }
+  .input-group label { display: block; margin-bottom: 8px; font-weight: 500; }
+  .input-group input {
+    width: 100%;
+    padding: 12px 16px;
+    border-radius: 4px;
+    border: 1px solid #e9ecef;
+    background: white;
+    color: #333;
+    font-size: 1rem;
+  }
+  .input-group input::placeholder { color: #999; }
+  .btn {
+    display: inline-block;
+    padding: 14px 28px;
+    background: #fff;
+    color: #333;
+    text-decoration: none;
+    border-radius: 4px;
+    font-size: 1rem;
+    font-weight: 500;
+    margin: 8px;
+    border: 2px solid #333;
+    cursor: pointer;
+    transition: all 0.2s ease;
+  }
+  .btn:hover {
+    background: #333;
+    color: #fff;
+  }
+  .btn.primary {
+    background: #333;
+    color: #fff;
+  }
+  .btn.primary:hover {
+    background: #000;
+  }
+  .note {
+    margin-top: 24px;
+    padding: 16px;
+    background: #f8f9fa;
+    border-radius: 4px;
+    font-size: 0.9rem;
+    color: #666;
+    text-align: left;
+  }
+</style>
+<div class="container">
+  <h1>サブスクリプション管理</h1>
+  <p class="subtitle">請求情報の確認・解約手続きを行うには、登録時のメールアドレスを入力してください。</p>
+
+  <form action="/portal" method="GET">
+    <div class="input-group">
+      <label for="email">メールアドレス</label>
+      <input type="email" id="email" name="email" placeholder="your@example.com" required>
+    </div>
+    <button type="submit" class="btn primary">請求管理画面を開く</button>
+  </form>
+
+  <div class="note">
+    <strong>注意事項</strong><br>
+    • 請求管理画面では解約・プラン変更・請求履歴の確認ができます<br>
+    • 解約後もサブスク期間終了まではProロールが維持されます<br>
+    • 解約時にDiscordからロールが自動で削除されます
+  </div>
+
+  <a href="/" class="btn">戻る</a>
+</div>
+  `;
+  res.type('html').send(html);
+});
+
+// Stripe 顧客ポータル（メールアドレスベース）
+app.get('/portal', async (req, res) => {
+  const email = req.query.email;
+  if (!email) return res.status(400).send('Email required');
+
+  try {
+    // メールアドレスで顧客を検索
+    const customers = await stripe.customers.list({
+      email: email,
+      limit: 1
+    });
+
+    if (customers.data.length === 0) {
+      const html = `
+<!doctype html><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>顧客が見つかりません</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: system-ui, -apple-system, "Noto Sans JP", sans-serif;
+    background: #f8f9fa;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #333;
+  }
+  .container {
+    max-width: 500px;
+    text-align: center;
+    padding: 48px 24px;
+    background: white;
+    border-radius: 8px;
+    border: 1px solid #e9ecef;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+  }
+  h1 { font-size: 1.8rem; margin-bottom: 16px; font-weight: 600; }
+  p { font-size: 1rem; color: #666; margin-bottom: 24px; }
+  .btn {
+    display: inline-block;
+    padding: 14px 28px;
+    background: #fff;
+    color: #333;
+    text-decoration: none;
+    border-radius: 4px;
+    font-size: 1rem;
+    font-weight: 500;
+    border: 2px solid #333;
+    transition: all 0.2s ease;
+  }
+  .btn:hover {
+    background: #333;
+    color: #fff;
+  }
+</style>
+<div class="container">
+  <h1>顧客が見つかりません</h1>
+  <p>入力されたメールアドレス（${email}）に関連するサブスクリプションが見つかりませんでした。</p>
+  <p>メールアドレスを確認して再度お試しください。</p>
+  <a href="/portal-lookup" class="btn">戻る</a>
+</div>
+      `;
+      return res.type('html').send(html);
+    }
+
+    const customer = customers.data[0];
+    const base = getBaseUrl(req);
+
+    const session = await stripe.billingPortal.sessions.create({
+      customer: customer.id,
+      return_url: base,
+    });
+
+    // Stripe APIから請求履歴を取得
+    const subscriptions = await stripe.subscriptions.list({
+      customer: customer.id,
+      limit: 10
+    });
+
+    const invoices = await stripe.invoices.list({
+      customer: customer.id,
+      limit: 10
+    });
+
+    // 現在のサブスクリプション情報
+    const currentSub = subscriptions.data.find(sub => sub.status === 'active');
+
+    const html = `
+<!doctype html><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>サブスクリプション情報</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: system-ui, -apple-system, "Noto Sans JP", sans-serif;
+    background: #f8f9fa;
+    min-height: 100vh;
+    padding: 24px;
+    color: #333;
+  }
+  .container {
+    max-width: 800px;
+    margin: 0 auto;
+    background: white;
+    border-radius: 8px;
+    border: 1px solid #e9ecef;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+  }
+  .header {
+    padding: 32px;
+    border-bottom: 1px solid #e9ecef;
+  }
+  .content {
+    padding: 32px;
+  }
+  h1 { font-size: 1.8rem; margin-bottom: 8px; font-weight: 600; }
+  .subtitle { font-size: 1rem; color: #666; margin-bottom: 24px; }
+  .info-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+    gap: 24px;
+    margin-bottom: 32px;
+  }
+  .info-card {
+    background: #f8f9fa;
+    padding: 20px;
+    border-radius: 8px;
+    border: 1px solid #e9ecef;
+  }
+  .info-card h3 {
+    font-size: 1rem;
+    margin-bottom: 12px;
+    color: #333;
+    font-weight: 600;
+  }
+  .info-card p {
+    font-size: 0.9rem;
+    color: #666;
+    margin-bottom: 8px;
+  }
+  .status-active { color: #28a745; font-weight: 600; }
+  .status-inactive { color: #dc3545; }
+  .table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-bottom: 24px;
+  }
+  .table th, .table td {
+    padding: 12px;
+    text-align: left;
+    border-bottom: 1px solid #e9ecef;
+  }
+  .table th {
+    background: #f8f9fa;
+    font-weight: 600;
+    font-size: 0.9rem;
+  }
+  .table td {
+    font-size: 0.9rem;
+  }
+  .btn {
+    display: inline-block;
+    padding: 12px 24px;
+    background: #fff;
+    color: #333;
+    text-decoration: none;
+    border-radius: 4px;
+    font-size: 0.9rem;
+    font-weight: 500;
+    border: 2px solid #333;
+    transition: all 0.2s ease;
+    margin-right: 12px;
+  }
+  .btn:hover {
+    background: #333;
+    color: #fff;
+  }
+  .section {
+    margin-bottom: 32px;
+  }
+  .section h2 {
+    font-size: 1.3rem;
+    margin-bottom: 16px;
+    font-weight: 600;
+  }
+</style>
+<div class="container">
+  <div class="header">
+    <h1>サブスクリプション情報</h1>
+    <p class="subtitle">${email}</p>
+  </div>
+
+  <div class="content">
+    <div class="section">
+      <h2>現在のプラン</h2>
+      <div class="info-grid">
+        ${currentSub ? `
+        <div class="info-card">
+          <h3>プラン詳細</h3>
+          <p>プラン: Discord Pro 月額</p>
+          <p>金額: ¥${(currentSub.items.data[0]?.price?.unit_amount || 0).toLocaleString()}/月</p>
+          <p>ステータス: <span class="status-active">有効</span></p>
+        </div>
+        <div class="info-card">
+          <h3>次回請求</h3>
+          <p>日付: ${new Date(currentSub.current_period_end * 1000).toLocaleDateString('ja-JP')}</p>
+          <p>開始日: ${new Date(currentSub.current_period_start * 1000).toLocaleDateString('ja-JP')}</p>
+        </div>
+        ` : `
+        <div class="info-card">
+          <h3>プラン詳細</h3>
+          <p class="status-inactive">アクティブなサブスクリプションがありません</p>
+        </div>
+        `}
+      </div>
+    </div>
+
+    <div class="section">
+      <h2>請求履歴</h2>
+      <table class="table">
+        <thead>
+          <tr>
+            <th>日付</th>
+            <th>金額</th>
+            <th>ステータス</th>
+            <th>期間</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${invoices.data.map(invoice => `
+          <tr>
+            <td>${new Date(invoice.created * 1000).toLocaleDateString('ja-JP')}</td>
+            <td>¥${(invoice.amount_paid / 100).toLocaleString()}</td>
+            <td>${invoice.status === 'paid' ? '支払済み' : invoice.status}</td>
+            <td>${invoice.period_start ? new Date(invoice.period_start * 1000).toLocaleDateString('ja-JP') + ' - ' + new Date(invoice.period_end * 1000).toLocaleDateString('ja-JP') : '-'}</td>
+          </tr>
+          `).join('')}
+        </tbody>
+      </table>
+    </div>
+
+    <div style="border-top: 1px solid #e9ecef; padding-top: 24px;">
+      <p style="color: #666; font-size: 0.9rem; margin-bottom: 16px;">
+        解約や変更をご希望の場合は、直接お問い合わせください。
+      </p>
+      <a href="mailto:s.sakuramoto@archi-prisma.co.jp?subject=Discord Pro 解約手続き&body=【Discord Pro 解約希望】%0A%0A■ 登録情報%0A・メールアドレス：${email}%0A・Discord ユーザー名：%0A・Discord ID（数字）：%0A%0A■ 解約希望日%0A・いつから解約したいですか：%0A%0A■ 解約理由（任意）%0A・理由があれば教えてください：%0A%0A■ その他%0A・ご質問やご要望があれば：%0A%0A※このメールに返信いただければ解約手続きを開始いたします。" class="btn">解約手続きのお問い合わせ</a>
+      <a href="/" class="btn">ホームに戻る</a>
+    </div>
+  </div>
+</div>
+    `;
+    res.type('html').send(html);
+  } catch (error) {
+    console.error('[portal] error:', error);
+    const html = `
+<!doctype html><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>エラー</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: system-ui, -apple-system, "Noto Sans JP", sans-serif;
+    background: #f8f9fa;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #333;
+  }
+  .container {
+    max-width: 500px;
+    text-align: center;
+    padding: 48px 24px;
+    background: white;
+    border-radius: 8px;
+    border: 1px solid #e9ecef;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+  }
+  h1 { font-size: 1.8rem; margin-bottom: 16px; font-weight: 600; color: #dc3545; }
+  p { font-size: 1rem; color: #666; margin-bottom: 24px; }
+  .btn {
+    display: inline-block;
+    padding: 14px 28px;
+    background: #fff;
+    color: #333;
+    text-decoration: none;
+    border-radius: 4px;
+    font-size: 1rem;
+    font-weight: 500;
+    border: 2px solid #333;
+    transition: all 0.2s ease;
+  }
+  .btn:hover {
+    background: #333;
+    color: #fff;
+  }
+</style>
+<div class="container">
+  <h1>エラーが発生しました</h1>
+  <p>請求管理ページへのアクセス中にエラーが発生しました。時間をおいて再度お試しください。</p>
+  <a href="/portal-lookup" class="btn">戻る</a>
+</div>
+    `;
+    res.status(500).type('html').send(html);
+  }
+});
+
+// Checkout Session作成API（二重契約・トライアル再利用防止付き）
+app.post('/api/create-checkout-session', async (req, res) => {
+  const { email, priceId, mode } = req.body;
+
+  if (!email) {
+    return res.status(400).json({ error: 'Email is required' });
+  }
+
+  // priceIdのデフォルトは月額プラン
+  const selectedPriceId = priceId || PRICE_IDS.monthly;
+  const checkoutMode = mode || 'subscription';
+
+  try {
+    // 1. 既存のCustomerを検索
+    const existingCustomers = await stripe.customers.list({
+      email: email,
+      limit: 1
+    });
+
+    let customer = existingCustomers.data[0];
+    let warnings = [];
+
+    if (customer) {
+      console.log(`[checkout] Found existing customer: ${customer.id}`);
+
+      // 2. 二重契約チェック: アクティブなサブスクリプションがあるか
+      const existingSubs = await stripe.subscriptions.list({
+        customer: customer.id,
+        status: 'active',
+        limit: 10
+      });
+
+      // 対象のPriceが含まれているアクティブなサブスクリプションがあるか
+      const hasActiveSub = existingSubs.data.some(sub => {
+        return sub.items.data.some(item => ENTITLED_PRICE_IDS.has(item.price.id));
+      });
+
+      if (hasActiveSub) {
+        return res.status(400).json({
+          error: 'duplicate_subscription',
+          message: '既にアクティブなサブスクリプションが存在します。複数のサブスクリプションを契約することはできません。'
+        });
+      }
+
+      // 3. トライアル再利用チェック
+      if (hasCustomerUsedTrial(customer)) {
+        warnings.push('このメールアドレスは既に無料トライアルを利用しています。今回は通常価格での契約となります。');
+        console.log(`[checkout] Customer ${customer.id} has already used trial`);
+      }
+    } else {
+      console.log(`[checkout] Creating new customer for email: ${email}`);
+    }
+
+    // 4. Checkout Session作成
+    const base = getBaseUrl(req);
+    const sessionParams = {
+      mode: checkoutMode,
+      customer: customer ? customer.id : undefined,
+      customer_email: customer ? undefined : email,
+      line_items: [
+        {
+          price: selectedPriceId,
+          quantity: 1
+        }
+      ],
+      success_url: `${base}/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${base}/?canceled=true`,
+      metadata: {
+        source: 'api_checkout'
+      }
+    };
+
+    // トライアル設定: 既存CustomerでトライアルONLY使用済みの場合はトライアルなし
+    if (customer && hasCustomerUsedTrial(customer)) {
+      // トライアルなしで即課金
+      sessionParams.subscription_data = {
+        trial_period_days: 0
+      };
+    } else if (checkoutMode === 'subscription') {
+      // 新規Customerまたはトライアル未使用の場合、30日間のトライアルを提供
+      sessionParams.subscription_data = {
+        trial_period_days: 30
+      };
+    }
+
+    const session = await stripe.checkout.sessions.create(sessionParams);
+
+    res.json({
+      url: session.url,
+      sessionId: session.id,
+      warnings: warnings.length > 0 ? warnings : undefined
+    });
+
+  } catch (error) {
+    console.error('[checkout] Error creating session:', error);
+    res.status(500).json({
+      error: 'internal_error',
+      message: 'Checkout Sessionの作成中にエラーが発生しました。'
+    });
+  }
+});
+
+// サンクスページ（「連携」ボタンあり）
+app.get('/success', async (req, res) => {
+  const code = req.query.session_id || req.query.code;
+  if (!code) return res.status(400).send('session_id or code is required');
+  const base = getBaseUrl(req);
+  const linkUrl = `${base}/oauth/discord/start?code=${encodeURIComponent(code)}`;
+  const portalUrl = `${base}/portal?code=${encodeURIComponent(code)}`;
+  const invite = CFG.DISCORD_GUILD_INVITE_URL;
+  const html = `
+<!doctype html><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>決済完了 | Discord Pro</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: system-ui, -apple-system, "Noto Sans JP", sans-serif;
+    background: #f8f9fa;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #333;
+  }
+  .container {
+    max-width: 600px;
+    text-align: center;
+    padding: 48px 24px;
+    background: white;
+    border-radius: 8px;
+    border: 1px solid #e9ecef;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+  }
+  h1 { font-size: 2.2rem; margin-bottom: 16px; font-weight: 600; }
+  .subtitle { font-size: 1.1rem; color: #666; margin-bottom: 32px; }
+  .steps {
+    background: #f8f9fa;
+    border-radius: 8px;
+    padding: 32px;
+    margin-bottom: 32px;
+    text-align: left;
+  }
+  .steps h2 { font-size: 1.3rem; margin-bottom: 20px; text-align: center; }
+  .step {
+    display: flex;
+    align-items: center;
+    margin-bottom: 16px;
+    padding: 16px;
+    background: white;
+    border-radius: 4px;
+    border: 1px solid #e9ecef;
+    font-size: 1rem;
+  }
+  .step-number {
+    background: #333;
+    color: white;
+    border-radius: 50%;
+    width: 28px;
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 600;
+    margin-right: 16px;
+    flex-shrink: 0;
+    font-size: 0.9rem;
+  }
+  .btn {
+    display: inline-block;
+    padding: 14px 28px;
+    background: #fff;
+    color: #333;
+    text-decoration: none;
+    border-radius: 4px;
+    font-size: 1rem;
+    font-weight: 500;
+    margin: 8px;
+    border: 2px solid #333;
+    transition: all 0.2s ease;
+  }
+  .btn:hover {
+    background: #333;
+    color: #fff;
+  }
+  .btn.primary {
+    background: #333;
+    color: #fff;
+  }
+  .btn.primary:hover {
+    background: #000;
+  }
+  .actions { margin-bottom: 32px; }
+  .manage-section {
+    padding-top: 32px;
+    border-top: 1px solid #e9ecef;
+  }
+  .note {
+    background: #f8f9fa;
+    border-radius: 4px;
+    padding: 20px;
+    margin-top: 24px;
+    font-size: 0.9rem;
+    color: #666;
+    text-align: left;
+  }
+</style>
+<div class="container">
+  <h1>決済完了</h1>
+  <p class="subtitle">Discord Pro メンバーシップが有効になりました</p>
+
+  <div class="steps">
+    <h2>次の手順</h2>
+    <div class="step">
+      <div class="step-number">1</div>
+      <div>Discordサーバーに参加（未参加の方のみ）</div>
+    </div>
+    <div class="step">
+      <div class="step-number">2</div>
+      <div>アカウント連携でProロールを取得</div>
+    </div>
+  </div>
+
+  <div class="actions">
+    <a class="btn primary" href="${invite}" target="_blank" rel="noopener">
+      Discordサーバーに参加
+    </a>
+    <a class="btn" href="${linkUrl}">
+      アカウント連携
+    </a>
+  </div>
+
+  <div class="manage-section">
+    <h3 style="margin-bottom: 16px; color: #666;">サブスクリプション管理</h3>
+    <a class="btn" href="mailto:s.sakuramoto@archi-prisma.co.jp?subject=Discord Pro 解約手続き&body=【Discord Pro 解約希望】%0A%0A■ 登録情報%0A・メールアドレス：%0A・Discord ユーザー名：%0A・Discord ID（数字）：%0A%0A■ 解約希望日%0A・いつから解約したいですか：%0A%0A■ 解約理由（任意）%0A・理由があれば教えてください：%0A%0A■ その他%0A・ご質問やご要望があれば：%0A%0A※このメールに返信いただければ解約手続きを開始いたします。">解約手続きのお問い合わせ</a>
+  </div>
+
+  <div class="note">
+    <strong>注意事項</strong><br>
+    • Discord認可画面で「アカウントにアクセス（ユーザー名）」と表示されます<br>
+    • 連携完了後、サーバーで「@pro」ロールが自動付与されます<br>
+    • 解約後もサブスク期間終了まではProロールが維持されます
+  </div>
+</div>
+  `;
+  res.type('html').send(html);
+});
+
+// Stripe 顧客ポータル（解約など）
+app.get('/portal', async (req, res) => {
+  const code = req.query.code;
+  if (!code) return res.status(400).send('code required');
+  try {
+    const session = await stripe.checkout.sessions.retrieve(String(code));
+    const customer = session.customer;
+    if (!customer) return res.status(400).send('customer not found for this code');
+    const base = getBaseUrl(req);
+    const portal = await stripe.billingPortal.sessions.create({
+      customer,
+      return_url: `${base}/success?code=${encodeURIComponent(String(code))}`
+    });
+    res.redirect(portal.url);
+  } catch (e) {
+    console.error('[portal] error:', e);
+    res.status(500).send('failed to create portal session');
+  }
+});
+
+// Discord OAuth start（identifyのみ）
+app.get('/oauth/discord/start', async (req, res) => {
+  const code = req.query.code;
+  if (!code) {
+    console.error('[oauth] No code provided in request');
+    return res.status(400).send('code (CHECKOUT_SESSION_ID) required');
+  }
+
+  const base = getBaseUrl(req);
+  const redirect = `${base}/oauth/discord/callback`;
+  const state = makeState(String(code));
+
+  // 詳細なデバッグ情報
+  console.log('=== DISCORD OAUTH START ===');
+  console.log('[oauth] Request headers:', req.headers);
+  console.log('[oauth] Base URL:', base);
+  console.log('[oauth] Client ID:', CFG.DISCORD_CLIENT_ID);
+  console.log('[oauth] Redirect URI:', redirect);
+  console.log('[oauth] State:', state);
+  console.log('[oauth] Session code:', code);
+
+  try {
+    const url = new URL('https://discord.com/api/oauth2/authorize');
+    url.searchParams.set('client_id', CFG.DISCORD_CLIENT_ID);
+    url.searchParams.set('response_type', 'code');
+    url.searchParams.set('redirect_uri', redirect);
+    url.searchParams.set('scope', 'identify');
+    url.searchParams.set('state', state);
+
+    console.log('[oauth] Full Discord OAuth URL:', url.toString());
+    console.log('=== REDIRECTING TO DISCORD ===');
+
+    res.redirect(url.toString());
+  } catch (error) {
+    console.error('[oauth] Error building Discord URL:', error);
+    res.status(500).send('Internal server error building OAuth URL');
+  }
+});
+
+// Discord OAuth callback
+app.get('/oauth/discord/callback', async (req, res) => {
+  console.log('=== DISCORD OAUTH CALLBACK ===');
+  console.log('[oauth] Full query params:', req.query);
+  console.log('[oauth] Request URL:', req.url);
+
+  const { code, state, error, error_description } = req.query;
+
+  // Discord側でエラーが発生した場合
+  if (error) {
+    console.error('[oauth] Discord OAuth error:', { error, error_description });
+    const errorMsg = `Discord OAuth Error: ${error}${error_description ? ` - ${error_description}` : ''}`;
+    return res.status(400).send(errorMsg);
+  }
+
+  if (!code || !state) {
+    console.error('[oauth] Missing parameters:', {
+      code: !!code,
+      state: !!state,
+      received_params: Object.keys(req.query)
+    });
+    return res.status(400).send('Missing required parameters (code or state)');
+  }
+
+  let sessionId;
+  try {
+    sessionId = parseState(String(state));
+    console.log('[oauth] Successfully parsed session ID:', sessionId);
+  } catch (e) {
+    console.error('[oauth] State parsing failed:', {
+      state: state,
+      error: e.message,
+      stack: e.stack
+    });
+    return res.status(400).send('Invalid state parameter');
+  }
+
+  const base = getBaseUrl(req);
+  const redirect = `${base}/oauth/discord/callback`;
+
+  try {
+    // デバッグ: 送信パラメータをログ出力
+    const tokenParams = {
+      client_id: CFG.DISCORD_CLIENT_ID,
+      client_secret: CFG.DISCORD_CLIENT_SECRET,
+      grant_type: 'authorization_code',
+      code: String(code),
+      redirect_uri: redirect
+    };
+    console.log('[oauth] Token exchange parameters:', {
+      client_id: tokenParams.client_id,
+      client_secret: tokenParams.client_secret ? `${tokenParams.client_secret.substring(0, 4)}...` : 'MISSING',
+      grant_type: tokenParams.grant_type,
+      code: tokenParams.code ? `${tokenParams.code.substring(0, 8)}...` : 'MISSING',
+      redirect_uri: tokenParams.redirect_uri
+    });
+
+    // トークン交換
+    const tokenRes = await fetch('https://discord.com/api/oauth2/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams(tokenParams)
+    });
+    if (!tokenRes.ok) {
+      const t = await tokenRes.text();
+      throw new Error(`${tokenRes.status} ${t}`);
+    }
+    const tokenJson = await tokenRes.json();
+    const accessToken = tokenJson.access_token;
+
+    // ユーザー取得（identify）
+    const meRes = await fetch('https://discord.com/api/users/@me', {
+      headers: { Authorization: `Bearer ${accessToken}` }
+    });
+    const me = await meRes.json();
+    const discordUserId = me.id;
+    if (!discordUserId) throw new Error('discord user id missing');
+
+    // CHECKOUT_SESSION_ID -> customer
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    const customerId = session.customer;
+    if (!customerId) throw new Error('customer not found for session');
+
+    // Firestore: linkCodes 保存（存在しない場合も保険）
+    await saveLinkCode(sessionId, customerId);
+
+    // Firestore: users/{discordUserId}
+    await firestore.collection('users').doc(discordUserId).set({
+      customerId,
+      linkedAt: Date.now(),
+      updatedAt: Date.now(),
+      lastSyncAt: 0
+    }, { merge: true });
+
+    // Stripeの購読状態でロール同期
+    const entitled = await isCustomerEntitled(customerId);
+    await ensureRole(discordUserId, entitled, `oauth_link entitle=${entitled}`);
+
+    const html = `
+<!doctype html><meta charset="utf-8">
+<title>Discord連携完了</title>
+<style>
+body{font-family:system-ui,-apple-system,"Noto Sans JP",sans-serif;max-width:720px;margin:48px auto;line-height:1.8}
+a.btn{display:inline-block;padding:12px 18px;border:1px solid #333;text-decoration:none;margin-right:12px}
+</style>
+<h1>Discord連携が完了しました</h1>
+<p>サーバ内で <b>@pro</b> ロールを${entitled ? '付与' : '剥奪'}しました。</p>
+<p><a class="btn" href="${CFG.DISCORD_GUILD_INVITE_URL}" target="_blank" rel="noopener">サーバを開く</a>
+<a class="btn" href="${base}/success?code=${encodeURIComponent(sessionId)}">戻る</a></p>
+<p>もしロールが反映されない場合：1分待ってリロード、または管理者が再同期を実行してください。</p>
+`;
+    res.type('html').send(html);
+  } catch (e) {
+    console.error('[oauth] error:', e);
+    res.status(500).send('OAuth link failed');
+  }
+});
+
+// 管理用：1日1回の再同期（Cloud Schedulerから叩く）
+app.post('/admin/resync', async (req, res) => {
+  const token = req.header('X-CRON-SECRET');
+  if (token !== CFG.SCHEDULER_TOKEN) return res.status(401).send('unauthorized');
+
+  try {
+    const snapshot = await firestore.collection('users').get();
+    let ok = 0, ng = 0;
+    for (const doc of snapshot.docs) {
+      const userId = doc.id;
+      const { customerId } = doc.data();
+      if (!customerId) { ng++; continue; }
+      try {
+        const entitled = await isCustomerEntitled(customerId);
+        await ensureRole(userId, entitled, `cron_resync entitle=${entitled}`);
+        await doc.ref.set({ lastSyncAt: Date.now(), updatedAt: Date.now() }, { merge: true });
+        ok++;
+      } catch (e) {
+        console.error('[resync] user error:', userId, e);
+        ng++;
+      }
+    }
+    res.json({ ok, ng, total: ok + ng });
+  } catch (e) {
+    console.error('[resync] error:', e);
+    res.status(500).send('resync failed');
+  }
+});
+
+// 管理用：Discord招待リンクを作成
+app.get('/admin/create-invite', async (req, res) => {
+  const token = req.query.token;
+  if (token !== CFG.SCHEDULER_TOKEN) return res.status(401).send('unauthorized');
+
+  try {
+    if (!discordReady) {
+      return res.status(503).json({ error: 'Discord bot not ready' });
+    }
+
+    const guild = await discord.guilds.fetch(CFG.DISCORD_GUILD_ID);
+
+    // すべてのチャンネルをフェッチ
+    await guild.channels.fetch();
+
+    // デバッグ：全チャンネルをログ出力
+    console.log('[admin] Available channels:');
+    guild.channels.cache.forEach(ch => {
+      console.log(`  - ${ch.name} (${ch.type}) - Text: ${ch.isTextBased()}`);
+    });
+
+    // 一般チャンネルを探す（最初のテキストチャンネル）
+    let channel = guild.channels.cache.find(ch => ch.isTextBased());
+
+    if (!channel) {
+      return res.status(500).json({
+        error: 'No text channel found',
+        availableChannels: guild.channels.cache.map(ch => ({ name: ch.name, type: ch.type }))
+      });
+    }
+
+    console.log('[admin] Using channel:', channel.name);
+
+    // 招待リンクを作成（無期限、無制限）
+    const invite = await channel.createInvite({
+      maxAge: 0,        // 無期限
+      maxUses: 0,       // 無制限
+      unique: true,     // 新しいリンクを作成
+      reason: 'Created by admin API'
+    });
+
+    console.log('[admin] Created new invite:', invite.url);
+
+    res.json({
+      success: true,
+      inviteUrl: invite.url,
+      inviteCode: invite.code,
+      channel: channel.name,
+      expiresAt: invite.expiresAt || 'Never',
+      maxUses: invite.maxUses || 'Unlimited'
+    });
+
+  } catch (e) {
+    console.error('[admin] create-invite error:', e);
+    res.status(500).json({ error: e.message, stack: e.stack });
+  }
+});
+
+// ------- ユーティリティ -------
+
+function getBaseUrl(req) {
+  const proto = (req.headers['x-forwarded-proto'] || 'http').split(',')[0];
+  const host = (req.headers['x-forwarded-host'] || req.headers['host']);
+  return `${proto}://${host}`;
+}
+
+function makeState(code) {
+  const nonce = crypto.randomBytes(16).toString('hex');
+  const payload = `${code}|${nonce}`;
+  const h = crypto.createHmac('sha256', CFG.OAUTH_STATE_SECRET).update(payload).digest('hex');
+  const raw = `${payload}|${h}`;
+  return Buffer.from(raw).toString('base64url');
+}
+function parseState(state) {
+  const raw = Buffer.from(state, 'base64url').toString();
+  const [code, nonce, sig] = raw.split('|');
+  const expect = crypto.createHmac('sha256', CFG.OAUTH_STATE_SECRET).update(`${code}|${nonce}`).digest('hex');
+  if (expect !== sig) throw new Error('bad state signature');
+  return code; // sessionId
+}
+
+function hasCustomerUsedTrial(customer) {
+  if (!customer || !customer.metadata) return false;
+  const value = customer.metadata.trial_used;
+  return typeof value === 'string' ? value.toLowerCase() === 'true' : Boolean(value);
+}
+
+async function maybeMarkTrialUsed(subscription) {
+  if (!subscription) return;
+  if (subscription.status !== 'trialing') return;
+  if (!subscription.trial_end || subscription.trial_end * 1000 < Date.now()) return;
+  const customerId = typeof subscription.customer === 'string'
+    ? subscription.customer
+    : subscription.customer?.id;
+  if (!customerId) return;
+  try {
+    const customer = await stripe.customers.retrieve(customerId);
+    if (hasCustomerUsedTrial(customer)) return;
+    const metadata = {
+      ...(customer.metadata || {}),
+      trial_used: 'true',
+      trial_used_at: new Date().toISOString(),
+      trial_subscription_id: subscription.id
+    };
+    await stripe.customers.update(customerId, { metadata });
+    console.log(`[trial] marked usage for ${customerId}`);
+  } catch (err) {
+    console.error('[trial] metadata update failed:', err.message || err);
+  }
+}
+
+async function saveLinkCode(sessionId, customerId) {
+  if (!firestore) {
+    console.warn('[firestore] Not initialized, skipping saveLinkCode');
+    return;
+  }
+  try {
+    const ref = firestore.collection('linkCodes').doc(sessionId);
+    await ref.set({
+      customerId, createdAt: Date.now(),
+      expiresAt: Date.now() + 1000 * 60 * 60 * 24 * 14, // 14日
+      used: false
+    }, { merge: true });
+  } catch (err) {
+    console.error('[firestore] saveLinkCode error:', err);
+  }
+}
+
+async function isCustomerEntitled(customerId) {
+  // 対象price（月/年）で、即時付与条件：status active|trialing かつ cancel_at_period_end=false
+  const subs = await stripe.subscriptions.list({
+    customer: customerId,
+    status: 'all',
+    limit: 20
+  });
+  const okStatuses = new Set(['active', 'trialing']);
+  const okPriceIds = ENTITLED_PRICE_IDS;
+  for (const s of subs.data) {
+    const hasPrice = s.items.data.some(it => okPriceIds.has(it.price.id));
+    if (!hasPrice) continue;
+    if (okStatuses.has(s.status) && !s.cancel_at_period_end) return true;
+  }
+  return false;
+}
+
+async function handleSubChange(subscription) {
+  const customerId = subscription.customer;
+  const entitled = await isCustomerEntitled(customerId);
+
+  // customerId -> discord user を解決
+  const usersSnap = await firestore.collection('users').where('customerId', '==', customerId).get();
+  if (usersSnap.empty) {
+    // 未連携の可能性：linkCodesに保存してあるため、後でOAuth完了時に同期される
+    console.log('[subChange] no linked discord user yet for customer:', customerId);
+    return;
+  }
+  for (const doc of usersSnap.docs) {
+    const discordUserId = doc.id;
+    await ensureRole(discordUserId, entitled, `webhook_sub entitle=${entitled}`);
+    await doc.ref.set({ updatedAt: Date.now() }, { merge: true });
+  }
+}
+
+async function ensureRole(discordUserId, shouldHaveRole, reason) {
+  if (!discordReady) {
+    console.warn('[discord] not ready yet, delaying 2s');
+    await new Promise(r => setTimeout(r, 2000));
+  }
+  const guild = await discord.guilds.fetch(CFG.DISCORD_GUILD_ID);
+  let member;
+  try {
+    member = await guild.members.fetch(discordUserId);
+  } catch (e) {
+    console.error('[discord] member fetch failed (未参加の可能性):', discordUserId, e?.code || e.message);
+    return;
+  }
+  const roleId = CFG.DISCORD_PRO_ROLE_ID;
+  const hasRole = member.roles.cache.has(roleId);
+
+  if (shouldHaveRole && !hasRole) {
+    await member.roles.add(roleId, reason);
+    console.log(`[discord] add role @pro to ${discordUserId}`);
+  } else if (!shouldHaveRole && hasRole) {
+    await member.roles.remove(roleId, reason);
+    console.log(`[discord] remove role @pro from ${discordUserId}`);
+  } else {
+    console.log(`[discord] role up-to-date (${shouldHaveRole ? 'keep' : 'no-role'}) for ${discordUserId}`);
+  }
+}
+
+// ------- サーバ起動 -------
+app.listen(PORT, () => {
+  console.log(`Listening on :${PORT} (mode=${CFG.STRIPE_MODE})`);
+});

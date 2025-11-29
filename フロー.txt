@@ -1,0 +1,1258 @@
+# Stripe(JPY) × Discord ロール自動化 | Cloud Run + Firestore 完全ワークフロー生成プロンプト
+
+**役割**: 上級テクニカルライター兼DevOpsコーチ
+**対象**: 時間がない個人事業者/小規模チームのオーナー（非エンジニアでも実行可能）
+**トーン**: やさしく断定的。迷わせない。
+**OS前提**: macOS / Linux
+
+---
+
+## 00_ゴールと完成図
+
+**やること**: Stripeで定期課金（JPY/月¥5,000・年¥50,000）→ 決済完了者がDiscordサーバーに参加し、`@pro`ロールを自動付与。解約時は自動剥奪。
+**成果物**: Cloud Run上のNode/Expressサーバ + Firestore + Secret Manager + Cloud Scheduler（再同期）+ Stripe Webhook + Discord OAuth(Bot)の一式。
+
+### 全体像（データフロー図 / ASCII）
+
+```
+ [購入者] --(Checkout)--> [Stripe Checkout]
+     |                        |
+     | success_url: https://<RunURL>/success?code={CHECKOUT_SESSION_ID}
+     |                        |
+     v                        v
+ [ブラウザ] <---- Webhook --- [Stripe] 
+     |                         \
+     | 1) 「連携」クリック       \ 2) customer.subscription.* で状態通知
+     v                          \
+ /oauth/discord/start?code=...   \
+     | (Discord OAuth identify)   \
+     v                             v
+ [Discord] --- user id ---> [Cloud Run API]
+                         |-> Firestore(linkCodes/users)
+                         |-> Discord Bot(Manage Roles)
+                         |-> 役職付与/剥奪(@pro)
+                         |-> Cloud Scheduler(1日1回再同期)
+```
+
+### 完成の定義（Doneの基準）
+
+* ローカルで `stripe listen` でWebhook検証が通る（200）。
+* 本番のCloud Run URLでStripe Webhookが**200**を返す。
+* 解約時に`@pro`ロールが**自動で剥奪**される。
+* 管理者がHTTP再同期を叩けば、ロール状態が**正に回復**する。
+
+### 所要時間と費用目安
+
+* **所要時間**: 90〜120分（初回）
+* **ランニング**: Free/低額（Firestore無料枠、Cloud Run最小構成、Scheduler 毎日1回）
+
+**ここまでできていればOKチェック**
+
+* [ ] 「完成の定義」を理解した
+* [ ] Stripe/Discord/Google Cloudの3者を使うイメージが掴めた
+
+---
+
+## 01_必要なもの（所要時間と費用の目安）
+
+**やること**: 必要アカウントとCLIを用意
+**成果物**: 作業端末にgcloud/Node/Stripe CLI、各サービスのアカウント
+
+**必須**
+
+* Googleアカウント（Billing有効化）
+* Stripeアカウント（本番運用前提、ただし最初は**テスト**で構築→切替）
+* Discordアカウント（Botをサーバに招待できる権限）
+* Node.js v18+（LTS推奨）
+* gcloud CLI（Cloud Run/Firestore/Secret/Scheduler操作用）
+* Stripe CLI（ローカルWebhook検証用）
+
+**インストール（macOS/Linux共通：Homebrewが無い場合は導入推奨）**
+
+```bash
+# Homebrew（必要な方のみ）
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+# Node 18+（例：バイナリ or nvm は各自の標準手順でOK。ここではbrew例）
+brew install node
+
+# gcloud（標準のGoogle Cloud SDK手順に従う。既に入っていれば不要）
+# ここではコマンド短縮：インストール済み前提で進行
+
+# Stripe CLI
+brew install stripe/stripe-cli/stripe
+
+# ログイン（ブラウザ開く）
+stripe login
+```
+
+**ここまでできていればOKチェック**
+
+* [ ] `node -v` が 18以上
+* [ ] `gcloud version` が表示される
+* [ ] `stripe login` 済み
+
+---
+
+## 02_変数一覧と値の決め方
+
+**やること**: 変数（環境変数）を一元定義
+**成果物**: このドキュメント内のコマンド・コードで**同名変数**を使い回す
+
+> ※値はあなたの環境で置換。`<PLACEHOLDER_...>`は後の手順で取得。
+
+```bash
+# ── GCP 基本
+export PROJECT_ID="<PLACEHOLDER_GCP_PROJECT_ID>"
+export REGION="asia-northeast1"
+export SERVICE_NAME="stripe-discord-pro"
+
+# ── Stripe（テスト／本番をスイッチ）
+export STRIPE_MODE="test" # test | live
+export STRIPE_SECRET_KEY_TEST="<PLACEHOLDER_STRIPE_SK_TEST>"
+export STRIPE_WEBHOOK_SECRET_TEST="<PLACEHOLDER_STRIPE_WHSEC_TEST>"
+export STRIPE_PRICE_ID_MONTHLY_TEST="<PLACEHOLDER_PRICE_MONTHLY_TEST>"   # JPY 5,000/月
+export STRIPE_PRICE_ID_YEARLY_TEST="<PLACEHOLDER_PRICE_YEARLY_TEST>"     # JPY 50,000/年
+
+export STRIPE_SECRET_KEY_LIVE="<PLACEHOLDER_STRIPE_SK_LIVE>"
+export STRIPE_WEBHOOK_SECRET_LIVE="<PLACEHOLDER_STRIPE_WHSEC_LIVE>"
+export STRIPE_PRICE_ID_MONTHLY_LIVE="<PLACEHOLDER_PRICE_MONTHLY_LIVE>"   # JPY 5,000/月
+export STRIPE_PRICE_ID_YEARLY_LIVE="<PLACEHOLDER_PRICE_YEARLY_LIVE>"     # JPY 50,000/年
+
+# ── Discord
+export DISCORD_CLIENT_ID="<PLACEHOLDER_DISCORD_CLIENT_ID>"
+export DISCORD_CLIENT_SECRET="<PLACEHOLDER_DISCORD_CLIENT_SECRET>"
+export DISCORD_BOT_TOKEN="<PLACEHOLDER_DISCORD_BOT_TOKEN>"
+export DISCORD_GUILD_ID="<PLACEHOLDER_DISCORD_GUILD_ID>"
+export DISCORD_PRO_ROLE_ID="<PLACEHOLDER_DISCORD_ROLE_ID_PRO>"           # 役職「@pro」
+export DISCORD_GUILD_INVITE_URL="https://discord.gg/87fs9DxDyv" # サーバ参加URL
+
+# ── OAuth/セキュリティ
+export OAUTH_STATE_SECRET="<PLACEHOLDER_RANDOM_32B_HEX>"                 # 例: openssl rand -hex 32
+export SCHEDULER_TOKEN="<PLACEHOLDER_RANDOM_32B_HEX>"                    # Cron用共有秘密
+
+# ── Firestore/Run
+export GCP_PROJECT_ID="$PROJECT_ID"
+```
+
+**ここまでできていればOKチェック**
+
+* [ ] すべての `<PLACEHOLDER_...>` の意味がわかった
+* [ ] `STRIPE_MODE`の切替でテスト←→本番を制御する理解がある
+
+---
+
+## 03_プロジェクト初期化とローカル動作
+
+**やること**: GCP初期設定・API有効化・Firestore作成・ローカル起動準備
+**成果物**: ローカルでWebhook検証（`stripe listen`）が可能になる
+
+### 3.1 GCP初期設定
+
+```bash
+gcloud config set project $PROJECT_ID
+gcloud services enable run.googleapis.com cloudbuild.googleapis.com \
+  firestore.googleapis.com secretmanager.googleapis.com \
+  cloudscheduler.googleapis.com logging.googleapis.com iam.googleapis.com
+
+# Firestore（Nativeモード）
+gcloud firestore databases create --location=$REGION
+```
+
+### 3.2 ソース雛形作成
+
+```bash
+mkdir stripe-discord && cd stripe-discord
+npm init -y
+
+# 依存パッケージ
+npm install express stripe discord.js @google-cloud/firestore dotenv
+npm install --save-dev nodemon
+
+# 必要ファイル作成（後章で中身を全貼り）
+touch index.js Dockerfile .gcloudignore .env.example
+mkdir -p scripts
+touch scripts/setup.sh scripts/dev.sh scripts/stripe-forward.sh scripts/deploy.sh
+```
+
+### 3.3 ローカル .env テンプレ
+
+```bash
+cat > .env.example <<'EOF'
+# STRIPE
+STRIPE_MODE=test
+STRIPE_SECRET_KEY_TEST=
+STRIPE_WEBHOOK_SECRET_TEST=
+STRIPE_PRICE_ID_MONTHLY_TEST=
+STRIPE_PRICE_ID_YEARLY_TEST=
+STRIPE_SECRET_KEY_LIVE=
+STRIPE_WEBHOOK_SECRET_LIVE=
+STRIPE_PRICE_ID_MONTHLY_LIVE=
+STRIPE_PRICE_ID_YEARLY_LIVE=
+
+# DISCORD
+DISCORD_CLIENT_ID=
+DISCORD_CLIENT_SECRET=
+DISCORD_BOT_TOKEN=
+DISCORD_GUILD_ID=
+DISCORD_PRO_ROLE_ID=
+DISCORD_GUILD_INVITE_URL=https://discord.gg/87fs9DxDyv
+
+# OAUTH/SECURITY
+OAUTH_STATE_SECRET=
+SCHEDULER_TOKEN=
+
+# GCP
+GCP_PROJECT_ID=
+EOF
+```
+
+**ここまでできていればOKチェック**
+
+* [ ] GCPのAPIが有効化された
+* [ ] `.env.example` が生成された
+
+---
+
+## 04_ファイル構成とコード全文
+
+**やること**: ルートツリーと主要ファイルを**全文**貼付
+**成果物**: コピペでそのままビルド/実行できる一式
+
+### 4.1 ルートツリー
+
+```
+stripe-discord/
+├─ index.js
+├─ package.json
+├─ Dockerfile
+├─ .gcloudignore
+├─ .env.example
+└─ scripts/
+   ├─ setup.sh
+   ├─ dev.sh
+   ├─ stripe-forward.sh
+   └─ deploy.sh
+```
+
+### 4.2 package.json（全文）
+
+```json
+{
+  "name": "stripe-discord-pro",
+  "version": "1.0.0",
+  "description": "Stripe(JPY) × Discord ロール自動化 (Cloud Run + Firestore)",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "dev": "nodemon --watch index.js index.js",
+    "start": "node index.js",
+    "setup": "bash scripts/setup.sh",
+    "deploy": "bash scripts/deploy.sh",
+    "stripe:forward": "bash scripts/stripe-forward.sh"
+  },
+  "dependencies": {
+    "@google-cloud/firestore": "^7.10.0",
+    "discord.js": "^14.15.3",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "stripe": "^16.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
+```
+
+### 4.3 Dockerfile（全文）
+
+```dockerfile
+FROM node:20-slim
+
+WORKDIR /usr/src/app
+
+# 依存定義のみ先にコピーしてキャッシュ最適化
+COPY package*.json ./
+RUN npm ci --omit=dev
+
+# アプリ本体
+COPY . .
+
+ENV NODE_ENV=production
+ENV PORT=8080
+EXPOSE 8080
+
+CMD ["node", "index.js"]
+```
+
+### 4.4 .gcloudignore（全文）
+
+```
+node_modules
+.git
+.env
+*.log
+.DS_Store
+```
+
+### 4.5 scripts/setup.sh（全文）
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${PROJECT_ID:?set PROJECT_ID}"; : "${REGION:?set REGION}"
+
+echo "[Enable APIs]"
+gcloud services enable run.googleapis.com cloudbuild.googleapis.com \
+  firestore.googleapis.com secretmanager.googleapis.com \
+  cloudscheduler.googleapis.com logging.googleapis.com iam.googleapis.com
+
+echo "[Create Firestore DB (if not exists)]"
+gcloud firestore databases create --location=$REGION || true
+
+echo "[Derive Service Account]"
+PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')
+CLOUD_RUN_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+echo "Service Account: $CLOUD_RUN_SA"
+
+echo "[Create Secrets if missing]"
+create_secret() {
+  local name="$1"
+  gcloud secrets describe "$name" >/dev/null 2>&1 || gcloud secrets create "$name"
+}
+# Secrets一覧
+for S in \
+  STRIPE_MODE \
+  STRIPE_SECRET_KEY_TEST STRIPE_WEBHOOK_SECRET_TEST STRIPE_PRICE_ID_MONTHLY_TEST STRIPE_PRICE_ID_YEARLY_TEST \
+  STRIPE_SECRET_KEY_LIVE STRIPE_WEBHOOK_SECRET_LIVE STRIPE_PRICE_ID_MONTHLY_LIVE STRIPE_PRICE_ID_YEARLY_LIVE \
+  DISCORD_CLIENT_ID DISCORD_CLIENT_SECRET DISCORD_BOT_TOKEN DISCORD_GUILD_ID DISCORD_PRO_ROLE_ID DISCORD_GUILD_INVITE_URL \
+  OAUTH_STATE_SECRET SCHEDULER_TOKEN GCP_PROJECT_ID
+do
+  create_secret "$S"
+done
+
+echo "[Grant Secret Access to Cloud Run SA]"
+for S in \
+  STRIPE_MODE \
+  STRIPE_SECRET_KEY_TEST STRIPE_WEBHOOK_SECRET_TEST STRIPE_PRICE_ID_MONTHLY_TEST STRIPE_PRICE_ID_YEARLY_TEST \
+  STRIPE_SECRET_KEY_LIVE STRIPE_WEBHOOK_SECRET_LIVE STRIPE_PRICE_ID_MONTHLY_LIVE STRIPE_PRICE_ID_YEARLY_LIVE \
+  DISCORD_CLIENT_ID DISCORD_CLIENT_SECRET DISCORD_BOT_TOKEN DISCORD_GUILD_ID DISCORD_PRO_ROLE_ID DISCORD_GUILD_INVITE_URL \
+  OAUTH_STATE_SECRET SCHEDULER_TOKEN GCP_PROJECT_ID
+do
+  gcloud secrets add-iam-policy-binding "$S" \
+    --member="serviceAccount:$CLOUD_RUN_SA" \
+    --role="roles/secretmanager.secretAccessor" >/dev/null
+done
+
+echo "Setup done."
+```
+
+### 4.6 scripts/dev.sh（全文）
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+cp .env.example .env 2>/dev/null || true
+echo ">>> .env を編集して値をセットしてください"
+echo ">>> ローカル起動: npm run dev"
+```
+
+### 4.7 scripts/stripe-forward.sh（全文）
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+# Stripe Webhookをローカルに転送
+stripe listen --events checkout.session.completed,customer.subscription.updated,customer.subscription.deleted \
+  --forward-to localhost:8080/stripe/webhook
+```
+
+### 4.8 scripts/deploy.sh（全文）
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${PROJECT_ID:?set PROJECT_ID}"
+: "${REGION:?set REGION}"
+: "${SERVICE_NAME:?set SERVICE_NAME}"
+
+# Cloud Run ソースデプロイ（Artifact Registryの事前準備不要）
+gcloud run deploy "$SERVICE_NAME" \
+  --source . \
+  --region "$REGION" \
+  --allow-unauthenticated \
+  --set-secrets \
+STRIPE_MODE=STRIPE_MODE:latest,\
+STRIPE_SECRET_KEY_TEST=STRIPE_SECRET_KEY_TEST:latest,\
+STRIPE_WEBHOOK_SECRET_TEST=STRIPE_WEBHOOK_SECRET_TEST:latest,\
+STRIPE_PRICE_ID_MONTHLY_TEST=STRIPE_PRICE_ID_MONTHLY_TEST:latest,\
+STRIPE_PRICE_ID_YEARLY_TEST=STRIPE_PRICE_ID_YEARLY_TEST:latest,\
+STRIPE_SECRET_KEY_LIVE=STRIPE_SECRET_KEY_LIVE:latest,\
+STRIPE_WEBHOOK_SECRET_LIVE=STRIPE_WEBHOOK_SECRET_LIVE:latest,\
+STRIPE_PRICE_ID_MONTHLY_LIVE=STRIPE_PRICE_ID_MONTHLY_LIVE:latest,\
+STRIPE_PRICE_ID_YEARLY_LIVE=STRIPE_PRICE_ID_YEARLY_LIVE:latest,\
+DISCORD_CLIENT_ID=DISCORD_CLIENT_ID:latest,\
+DISCORD_CLIENT_SECRET=DISCORD_CLIENT_SECRET:latest,\
+DISCORD_BOT_TOKEN=DISCORD_BOT_TOKEN:latest,\
+DISCORD_GUILD_ID=DISCORD_GUILD_ID:latest,\
+DISCORD_PRO_ROLE_ID=DISCORD_PRO_ROLE_ID:latest,\
+DISCORD_GUILD_INVITE_URL=DISCORD_GUILD_INVITE_URL:latest,\
+OAUTH_STATE_SECRET=OAUTH_STATE_SECRET:latest,\
+SCHEDULER_TOKEN=SCHEDULER_TOKEN:latest,\
+GCP_PROJECT_ID=GCP_PROJECT_ID:latest
+
+# URL確認
+SERVICE_URL=$(gcloud run services describe "$SERVICE_NAME" --region "$REGION" --format 'value(status.url)')
+echo "Deployed: $SERVICE_URL"
+```
+
+### 4.9 index.js（全文：Express + Stripe + discord.js + Firestore）
+
+```js
+'use strict';
+
+require('dotenv').config();
+const express = require('express');
+const crypto = require('crypto');
+const Stripe = require('stripe');
+const { Firestore } = require('@google-cloud/firestore');
+const { Client, GatewayIntentBits, Partials } = require('discord.js');
+
+// Discord招待リンクの既定値
+const DEFAULT_DISCORD_INVITE_URL = 'https://discord.gg/87fs9DxDyv';
+
+// ------- 環境変数の取得と整形 -------
+const CFG = {
+  STRIPE_MODE: process.env.STRIPE_MODE || 'test', // 'test' | 'live'
+
+  STRIPE_SECRET_KEY_TEST: process.env.STRIPE_SECRET_KEY_TEST || '',
+  STRIPE_WEBHOOK_SECRET_TEST: process.env.STRIPE_WEBHOOK_SECRET_TEST || '',
+  STRIPE_PRICE_ID_MONTHLY_TEST: process.env.STRIPE_PRICE_ID_MONTHLY_TEST || '',
+  STRIPE_PRICE_ID_YEARLY_TEST: process.env.STRIPE_PRICE_ID_YEARLY_TEST || '',
+
+  STRIPE_SECRET_KEY_LIVE: process.env.STRIPE_SECRET_KEY_LIVE || '',
+  STRIPE_WEBHOOK_SECRET_LIVE: process.env.STRIPE_WEBHOOK_SECRET_LIVE || '',
+  STRIPE_PRICE_ID_MONTHLY_LIVE: process.env.STRIPE_PRICE_ID_MONTHLY_LIVE || '',
+  STRIPE_PRICE_ID_YEARLY_LIVE: process.env.STRIPE_PRICE_ID_YEARLY_LIVE || '',
+
+  DISCORD_CLIENT_ID: process.env.DISCORD_CLIENT_ID || '',
+  DISCORD_CLIENT_SECRET: process.env.DISCORD_CLIENT_SECRET || '',
+  DISCORD_BOT_TOKEN: process.env.DISCORD_BOT_TOKEN || '',
+  DISCORD_GUILD_ID: process.env.DISCORD_GUILD_ID || '',
+  DISCORD_PRO_ROLE_ID: process.env.DISCORD_PRO_ROLE_ID || '',
+  DISCORD_GUILD_INVITE_URL: process.env.DISCORD_GUILD_INVITE_URL || DEFAULT_DISCORD_INVITE_URL,
+
+  OAUTH_STATE_SECRET: process.env.OAUTH_STATE_SECRET || '',
+  SCHEDULER_TOKEN: process.env.SCHEDULER_TOKEN || '',
+
+  GCP_PROJECT_ID: process.env.GCP_PROJECT_ID || process.env.PROJECT_ID || ''
+};
+
+function assertEnv() {
+  const required = [
+    'STRIPE_MODE',
+    'DISCORD_CLIENT_ID','DISCORD_CLIENT_SECRET','DISCORD_BOT_TOKEN',
+    'DISCORD_GUILD_ID','DISCORD_PRO_ROLE_ID','DISCORD_GUILD_INVITE_URL',
+    'OAUTH_STATE_SECRET','SCHEDULER_TOKEN'
+  ];
+  required.forEach(k => {
+    if (!CFG[k]) {
+      console.warn(`⚠ Missing ENV: ${k}`);
+    }
+  });
+}
+assertEnv();
+
+function modePick(testVal, liveVal) {
+  return CFG.STRIPE_MODE === 'live' ? liveVal : testVal;
+}
+
+const STRIPE_SECRET_KEY = modePick(CFG.STRIPE_SECRET_KEY_TEST, CFG.STRIPE_SECRET_KEY_LIVE);
+const STRIPE_WEBHOOK_SECRET = modePick(CFG.STRIPE_WEBHOOK_SECRET_TEST, CFG.STRIPE_WEBHOOK_SECRET_LIVE);
+const PRICE_IDS = {
+  monthly: modePick(CFG.STRIPE_PRICE_ID_MONTHLY_TEST, CFG.STRIPE_PRICE_ID_MONTHLY_LIVE),
+  yearly: modePick(CFG.STRIPE_PRICE_ID_YEARLY_TEST, CFG.STRIPE_PRICE_ID_YEARLY_LIVE)
+};
+
+// Stripeクライアント
+const stripe = new Stripe(STRIPE_SECRET_KEY);
+
+// Firestoreクライアント（ADC/ServiceAccount）
+const firestore = new Firestore({ projectId: CFG.GCP_PROJECT_ID });
+
+// Discordクライアント（最小Intent: Guilds + GuildMembers）
+const discord = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
+  partials: [Partials.GuildMember]
+});
+
+let discordReady = false;
+discord.once('ready', () => {
+  console.log(`[discord] Logged in as ${discord.user.tag}`);
+  discordReady = true;
+});
+
+discord.login(CFG.DISCORD_BOT_TOKEN).catch(err => {
+  console.error('Discord login failed:', err);
+  process.exit(1);
+});
+
+// ------- Express 構成 -------
+const app = express();
+const PORT = process.env.PORT || 8080;
+
+// Stripe Webhookは raw body が必要
+app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  let event;
+  try {
+    const sig = req.headers['stripe-signature'];
+    event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error('[webhook] signature verification failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  try {
+    switch (event.type) {
+      case 'checkout.session.completed': {
+        const session = event.data.object;
+        // code = session.id を success_url で渡す設計
+        await saveLinkCode(session.id, session.customer);
+        console.log(`[webhook] saved link code for session ${session.id}, customer ${session.customer}`);
+        break;
+      }
+      case 'customer.subscription.updated':
+      case 'customer.subscription.deleted': {
+        const sub = event.data.object;
+        await handleSubChange(sub);
+        break;
+      }
+      default:
+        // 他イベントは無視でOK
+        break;
+    }
+    return res.json({ received: true });
+  } catch (err) {
+    console.error('[webhook] handler error:', err);
+    return res.status(500).send('webhook handler error');
+  }
+});
+
+// 一般JSONは通常のparser
+app.use(express.json());
+
+// ---- ヘルス & ルート ----
+app.get('/healthz', (_req, res) => res.send('ok'));
+
+app.get('/', (req, res) => {
+  const base = getBaseUrl(req);
+  res.type('text').send([
+    'Stripe × Discord Role Automation',
+    `mode=${CFG.STRIPE_MODE}`,
+    `success URL example: ${base}/success?code={CHECKOUT_SESSION_ID}`
+  ].join('\n'));
+});
+
+// サンクスページ（「連携」ボタンあり）
+app.get('/success', async (req, res) => {
+  const code = req.query.code;
+  if (!code) return res.status(400).send('code is required (CHECKOUT_SESSION_ID)');
+  const base = getBaseUrl(req);
+  const linkUrl = `${base}/oauth/discord/start?code=${encodeURIComponent(code)}`;
+  const portalUrl = `${base}/portal?code=${encodeURIComponent(code)}`;
+  const invite = CFG.DISCORD_GUILD_INVITE_URL;
+  const html = `
+<!doctype html><meta charset="utf-8">
+<title>決済ありがとうございます｜Discord連携</title>
+<style>
+  body { font-family: system-ui, -apple-system, "Noto Sans JP", sans-serif; max-width: 720px; margin: 48px auto; line-height: 1.8; }
+  a.btn { display:inline-block; padding:12px 18px; border:1px solid #333; text-decoration:none; margin-right:12px }
+</style>
+<h1>決済ありがとうございます</h1>
+<p>次の順で完了します：</p>
+<ol>
+  <li>Discordサーバに参加（未参加の方）</li>
+  <li>アカウント連携（ボタンを押す）</li>
+</ol>
+<p>
+  <a class="btn" href="${invite}" target="_blank" rel="noopener">① サーバに参加</a>
+  <a class="btn" href="${linkUrl}">② Discord連携（@pro付与）</a>
+</p>
+<p>解約/請求情報の確認はこちら：</p>
+<p><a class="btn" href="${portalUrl}">請求管理（解約はこちら）</a></p>
+<hr>
+<h2>画面で確認すべき文言</h2>
+<ul>
+  <li>Discord認可画面に「アカウントにアクセス（ユーザー名）」と表示</li>
+  <li>完了後、サーバ側で「@pro」が自動付与</li>
+</ul>
+  `;
+  res.type('html').send(html);
+});
+
+// Stripe 顧客ポータル（解約など）
+app.get('/portal', async (req, res) => {
+  const code = req.query.code;
+  if (!code) return res.status(400).send('code required');
+  try {
+    const session = await stripe.checkout.sessions.retrieve(String(code));
+    const customer = session.customer;
+    if (!customer) return res.status(400).send('customer not found for this code');
+    const base = getBaseUrl(req);
+    const portal = await stripe.billingPortal.sessions.create({
+      customer,
+      return_url: `${base}/success?code=${encodeURIComponent(String(code))}`
+    });
+    res.redirect(portal.url);
+  } catch (e) {
+    console.error('[portal] error:', e);
+    res.status(500).send('failed to create portal session');
+  }
+});
+
+// Discord OAuth start（identifyのみ）
+app.get('/oauth/discord/start', async (req, res) => {
+  const code = req.query.code;
+  if (!code) return res.status(400).send('code (CHECKOUT_SESSION_ID) required');
+  const base = getBaseUrl(req);
+  const redirect = `${base}/oauth/discord/callback`;
+  const state = makeState(String(code));
+  const url = new URL('https://discord.com/api/oauth2/authorize');
+  url.searchParams.set('client_id', CFG.DISCORD_CLIENT_ID);
+  url.searchParams.set('response_type', 'code');
+  url.searchParams.set('redirect_uri', redirect);
+  url.searchParams.set('scope', 'identify'); // 最小スコープ
+  url.searchParams.set('state', state);
+  res.redirect(url.toString());
+});
+
+// Discord OAuth callback
+app.get('/oauth/discord/callback', async (req, res) => {
+  const { code, state } = req.query;
+  if (!code || !state) return res.status(400).send('missing params');
+
+  let sessionId;
+  try {
+    sessionId = parseState(String(state));
+  } catch (e) {
+    console.error('[oauth] state invalid:', e);
+    return res.status(400).send('invalid state');
+  }
+
+  const base = getBaseUrl(req);
+  const redirect = `${base}/oauth/discord/callback`;
+
+  try {
+    // トークン交換
+    const tokenRes = await fetch('https://discord.com/api/oauth2/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: CFG.DISCORD_CLIENT_ID,
+        client_secret: CFG.DISCORD_CLIENT_SECRET,
+        grant_type: 'authorization_code',
+        code: String(code),
+        redirect_uri: redirect
+      })
+    });
+    if (!tokenRes.ok) {
+      const t = await tokenRes.text();
+      throw new Error(`${tokenRes.status} ${t}`);
+    }
+    const tokenJson = await tokenRes.json();
+    const accessToken = tokenJson.access_token;
+
+    // ユーザー取得（identify）
+    const meRes = await fetch('https://discord.com/api/users/@me', {
+      headers: { Authorization: `Bearer ${accessToken}` }
+    });
+    const me = await meRes.json();
+    const discordUserId = me.id;
+    if (!discordUserId) throw new Error('discord user id missing');
+
+    // CHECKOUT_SESSION_ID -> customer
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    const customerId = session.customer;
+    if (!customerId) throw new Error('customer not found for session');
+
+    // Firestore: linkCodes 保存（存在しない場合も保険）
+    await saveLinkCode(sessionId, customerId);
+
+    // Firestore: users/{discordUserId}
+    await firestore.collection('users').doc(discordUserId).set({
+      customerId,
+      linkedAt: Date.now(),
+      updatedAt: Date.now(),
+      lastSyncAt: 0
+    }, { merge: true });
+
+    // Stripeの購読状態でロール同期
+    const entitled = await isCustomerEntitled(customerId);
+    await ensureRole(discordUserId, entitled, `oauth_link entitle=${entitled}`);
+
+    const html = `
+<!doctype html><meta charset="utf-8">
+<title>Discord連携完了</title>
+<style>
+body{font-family:system-ui,-apple-system,"Noto Sans JP",sans-serif;max-width:720px;margin:48px auto;line-height:1.8}
+a.btn{display:inline-block;padding:12px 18px;border:1px solid #333;text-decoration:none;margin-right:12px}
+</style>
+<h1>Discord連携が完了しました</h1>
+<p>サーバ内で <b>@pro</b> ロールを${entitled ? '付与' : '剥奪'}しました。</p>
+<p><a class="btn" href="${CFG.DISCORD_GUILD_INVITE_URL}" target="_blank" rel="noopener">サーバを開く</a>
+<a class="btn" href="${base}/success?code=${encodeURIComponent(sessionId)}">戻る</a></p>
+<p>もしロールが反映されない場合：1分待ってリロード、または管理者が再同期を実行してください。</p>
+`;
+    res.type('html').send(html);
+  } catch (e) {
+    console.error('[oauth] error:', e);
+    res.status(500).send('OAuth link failed');
+  }
+});
+
+// 管理用：1日1回の再同期（Cloud Schedulerから叩く）
+app.post('/admin/resync', async (req, res) => {
+  const token = req.header('X-CRON-SECRET');
+  if (token !== CFG.SCHEDULER_TOKEN) return res.status(401).send('unauthorized');
+
+  try {
+    const snapshot = await firestore.collection('users').get();
+    let ok = 0, ng = 0;
+    for (const doc of snapshot.docs) {
+      const userId = doc.id;
+      const { customerId } = doc.data();
+      if (!customerId) { ng++; continue; }
+      try {
+        const entitled = await isCustomerEntitled(customerId);
+        await ensureRole(userId, entitled, `cron_resync entitle=${entitled}`);
+        await doc.ref.set({ lastSyncAt: Date.now(), updatedAt: Date.now() }, { merge: true });
+        ok++;
+      } catch (e) {
+        console.error('[resync] user error:', userId, e);
+        ng++;
+      }
+    }
+    res.json({ ok, ng, total: ok + ng });
+  } catch (e) {
+    console.error('[resync] error:', e);
+    res.status(500).send('resync failed');
+  }
+});
+
+// ------- ユーティリティ -------
+
+function getBaseUrl(req) {
+  const proto = (req.headers['x-forwarded-proto'] || 'http').split(',')[0];
+  const host = (req.headers['x-forwarded-host'] || req.headers['host']);
+  return `${proto}://${host}`;
+}
+
+function makeState(code) {
+  const nonce = crypto.randomBytes(16).toString('hex');
+  const payload = `${code}|${nonce}`;
+  const h = crypto.createHmac('sha256', CFG.OAUTH_STATE_SECRET).update(payload).digest('hex');
+  const raw = `${payload}|${h}`;
+  return Buffer.from(raw).toString('base64url');
+}
+function parseState(state) {
+  const raw = Buffer.from(state, 'base64url').toString();
+  const [code, nonce, sig] = raw.split('|');
+  const expect = crypto.createHmac('sha256', CFG.OAUTH_STATE_SECRET).update(`${code}|${nonce}`).digest('hex');
+  if (expect !== sig) throw new Error('bad state signature');
+  return code; // sessionId
+}
+
+async function saveLinkCode(sessionId, customerId) {
+  const ref = firestore.collection('linkCodes').doc(sessionId);
+  await ref.set({
+    customerId, createdAt: Date.now(),
+    expiresAt: Date.now() + 1000 * 60 * 60 * 24 * 14, // 14日
+    used: false
+  }, { merge: true });
+}
+
+async function isCustomerEntitled(customerId) {
+  // 対象price（月/年）で、即時付与条件：status active|trialing かつ cancel_at_period_end=false
+  const subs = await stripe.subscriptions.list({
+    customer: customerId,
+    status: 'all',
+    limit: 20
+  });
+  const okStatuses = new Set(['active', 'trialing']);
+  const okPriceIds = new Set([PRICE_IDS.monthly, PRICE_IDS.yearly]);
+  for (const s of subs.data) {
+    const hasPrice = s.items.data.some(it => okPriceIds.has(it.price.id));
+    if (!hasPrice) continue;
+    if (okStatuses.has(s.status) && !s.cancel_at_period_end) return true;
+  }
+  return false;
+}
+
+async function handleSubChange(subscription) {
+  const customerId = subscription.customer;
+  const entitled = await isCustomerEntitled(customerId);
+
+  // customerId -> discord user を解決
+  const usersSnap = await firestore.collection('users').where('customerId', '==', customerId).get();
+  if (usersSnap.empty) {
+    // 未連携の可能性：linkCodesに保存してあるため、後でOAuth完了時に同期される
+    console.log('[subChange] no linked discord user yet for customer:', customerId);
+    return;
+  }
+  for (const doc of usersSnap.docs) {
+    const discordUserId = doc.id;
+    await ensureRole(discordUserId, entitled, `webhook_sub entitle=${entitled}`);
+    await doc.ref.set({ updatedAt: Date.now() }, { merge: true });
+  }
+}
+
+async function ensureRole(discordUserId, shouldHaveRole, reason) {
+  if (!discordReady) {
+    console.warn('[discord] not ready yet, delaying 2s');
+    await new Promise(r => setTimeout(r, 2000));
+  }
+  const guild = await discord.guilds.fetch(CFG.DISCORD_GUILD_ID);
+  let member;
+  try {
+    member = await guild.members.fetch(discordUserId);
+  } catch (e) {
+    console.error('[discord] member fetch failed (未参加の可能性):', discordUserId, e?.code || e.message);
+    return;
+  }
+  const roleId = CFG.DISCORD_PRO_ROLE_ID;
+  const hasRole = member.roles.cache.has(roleId);
+
+  if (shouldHaveRole && !hasRole) {
+    await member.roles.add(roleId, reason);
+    console.log(`[discord] add role @pro to ${discordUserId}`);
+  } else if (!shouldHaveRole && hasRole) {
+    await member.roles.remove(roleId, reason);
+    console.log(`[discord] remove role @pro from ${discordUserId}`);
+  } else {
+    console.log(`[discord] role up-to-date (${shouldHaveRole ? 'keep' : 'no-role'}) for ${discordUserId}`);
+  }
+}
+
+// ------- サーバ起動 -------
+app.listen(PORT, () => {
+  console.log(`Listening on :${PORT} (mode=${CFG.STRIPE_MODE})`);
+});
+```
+
+**ここまでできていればOKチェック**
+
+* [ ] `package.json/Dockerfile/index.js` をすべて貼れた
+* [ ] `scripts/*.sh` を作成済み
+
+---
+
+## 05_Firestore設計とルール
+
+**やること**: コレクション設計・インデックス配慮・セキュリティルール
+**成果物**: Firestoreコレクション/ルールの最小設計
+
+### コレクション設計
+
+* `linkCodes/{sessionId}`: `{ customerId, createdAt, expiresAt, used }`
+* `users/{discordUserId}`: `{ customerId, linkedAt, updatedAt, lastSyncAt }`
+
+> インデックス：デフォルトで十分。`users` の `where('customerId','==',...)` 単一フィールドクエリのみ使用 → 追加インデックス不要。
+
+### セキュリティルール（最小・すべて拒否）
+
+> サーバ側（Admin権限）からのみアクセスするため、クライアント公開はしません。
+> **⚠ 重要**: 万一クライアントから触るUIを作る場合は、別途ルール設計が必要です。
+
+```txt
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
+```
+
+**ここまでできていればOKチェック**
+
+* [ ] コレクション2種の役割が理解できた
+* [ ] ルールが「全面拒否」である
+
+---
+
+## 06_Stripe設定（JPY）
+
+**やること**: Product/Price作成（JPY）、Checkout成功URLの設計、Webhook登録
+**成果物**: 月額/年額のPrice ID、Webhook Secret、成功URLテンプレ
+
+### 6.1 価格
+
+* 月額: **¥5,000**（JPY）
+* 年額: **¥50,000**（JPY）
+
+  > StripeダッシュボードでProductとPriceを作成し、各PriceのIDをメモ。
+  > 例: `price_XXXX_month_jpy`, `price_YYYY_year_jpy`
+
+### 6.2 成功URLの設計
+
+* **成功URL**: `https://<CloudRunURL>/success?code={CHECKOUT_SESSION_ID}`
+
+  * これにより、`code` が**Checkout Session ID**として渡され、OAuth連携に利用可能。
+
+### 6.3 Webhook
+
+* イベント（最低）：`checkout.session.completed`, `customer.subscription.updated`, `customer.subscription.deleted`
+* **ローカル検証**
+
+  ```bash
+  # 1) アプリ起動
+  npm run dev
+
+  # 2) Webhook転送
+  npm run stripe:forward
+  ```
+* **本番**: Cloud RunのURLに対してStripeダッシュボードでエンドポイントを作成し、`STRIPE_WEBHOOK_SECRET_LIVE` に保存。
+
+**ここまでできていればOKチェック**
+
+* [ ] 価格ID（テスト/本番）を控えた
+* [ ] 成功URL `{CHECKOUT_SESSION_ID}` の意味がわかった
+* [ ] Webhook Secret（テスト/本番）を控えた
+
+---
+
+## 07_Discord設定と権限
+
+**やること**: Bot作成・招待URL・必要権限・ロール作成と並び順
+**成果物**: Botが`@pro`を付与/剥奪できる状態
+
+### 7.1 Bot作成と招待
+
+* アプリ作成後、Botを有効化し**TOKEN**を取得 → `DISCORD_BOT_TOKEN` に保存
+* **必要権限（最小）**: `Manage Roles` のみ（権限整数: **268435456**）
+* **招待URLテンプレ**
+
+  ```
+  https://discord.com/api/oauth2/authorize?client_id=<DISCORD_CLIENT_ID>&permissions=268435456&scope=bot%20applications.commands
+  ```
+
+### 7.2 Intents
+
+* Bot設定で **SERVER MEMBERS INTENT** を有効化
+* コードでは `GatewayIntentBits.Guilds` と `GuildMembers` のみ使用（最小）
+
+### 7.3 ロール作成と並び順
+
+* サーバ側で `@pro` ロールを作成 → `DISCORD_PRO_ROLE_ID` を取得
+* **⚠ 並び順**: **Botロール**が `@pro` より**上位**に配置されていること（これが低いと付与失敗）
+
+### 7.4 IDの取得方法
+
+* Discordクライアントで「開発者モード」をON → 対象を右クリック → **Copy ID**
+
+  * Guild ID → `DISCORD_GUILD_ID`
+  * Role ID (`@pro`) → `DISCORD_PRO_ROLE_ID`
+
+**ここまでできていればOKチェック**
+
+* [ ] Botの招待とサーバ参加が済んだ
+* [ ] Botの権限=Manage Roles のみ
+* [ ] Botロールが `@pro` より上位
+
+---
+
+## 08_Cloud Run/Secret Manager/デプロイ
+
+**やること**: シークレット登録→Cloud Runへデプロイ→URL取得
+**成果物**: 本番URL稼働
+
+### 8.1 Secret Managerに値登録
+
+```bash
+# 値の投入（例：echoで1行投入）
+echo -n "$STRIPE_MODE" | gcloud secrets versions add STRIPE_MODE --data-file=-
+
+# Stripe（テスト）
+echo -n "$STRIPE_SECRET_KEY_TEST" | gcloud secrets versions add STRIPE_SECRET_KEY_TEST --data-file=-
+echo -n "$STRIPE_WEBHOOK_SECRET_TEST" | gcloud secrets versions add STRIPE_WEBHOOK_SECRET_TEST --data-file=-
+echo -n "$STRIPE_PRICE_ID_MONTHLY_TEST" | gcloud secrets versions add STRIPE_PRICE_ID_MONTHLY_TEST --data-file=-
+echo -n "$STRIPE_PRICE_ID_YEARLY_TEST" | gcloud secrets versions add STRIPE_PRICE_ID_YEARLY_TEST --data-file=-
+
+# Stripe（本番）
+echo -n "$STRIPE_SECRET_KEY_LIVE" | gcloud secrets versions add STRIPE_SECRET_KEY_LIVE --data-file=-
+echo -n "$STRIPE_WEBHOOK_SECRET_LIVE" | gcloud secrets versions add STRIPE_WEBHOOK_SECRET_LIVE --data-file=-
+echo -n "$STRIPE_PRICE_ID_MONTHLY_LIVE" | gcloud secrets versions add STRIPE_PRICE_ID_MONTHLY_LIVE --data-file=-
+echo -n "$STRIPE_PRICE_ID_YEARLY_LIVE" | gcloud secrets versions add STRIPE_PRICE_ID_YEARLY_LIVE --data-file=-
+
+# Discord / Security / GCP
+echo -n "$DISCORD_CLIENT_ID" | gcloud secrets versions add DISCORD_CLIENT_ID --data-file=-
+echo -n "$DISCORD_CLIENT_SECRET" | gcloud secrets versions add DISCORD_CLIENT_SECRET --data-file=-
+echo -n "$DISCORD_BOT_TOKEN" | gcloud secrets versions add DISCORD_BOT_TOKEN --data-file=-
+echo -n "$DISCORD_GUILD_ID" | gcloud secrets versions add DISCORD_GUILD_ID --data-file=-
+echo -n "$DISCORD_PRO_ROLE_ID" | gcloud secrets versions add DISCORD_PRO_ROLE_ID --data-file=-
+echo -n "$DISCORD_GUILD_INVITE_URL" | gcloud secrets versions add DISCORD_GUILD_INVITE_URL --data-file=-
+echo -n "$OAUTH_STATE_SECRET" | gcloud secrets versions add OAUTH_STATE_SECRET --data-file=-
+echo -n "$SCHEDULER_TOKEN" | gcloud secrets versions add SCHEDULER_TOKEN --data-file=-
+echo -n "$GCP_PROJECT_ID" | gcloud secrets versions add GCP_PROJECT_ID --data-file=-
+```
+
+### 8.2 デプロイ（ソースから）
+
+```bash
+npm run deploy
+# 出力の URL をメモ： https://<SERVICE>-<REGION>-a.run.app
+```
+
+### 8.3 Webhook設定（本番）
+
+* Stripeダッシュボードで Endpoint: `https://<SERVICE_URL>/stripe/webhook` を追加
+* Webhook Secret を `STRIPE_WEBHOOK_SECRET_LIVE` に保存（上記手順でSecretに追加済みならOK）
+
+**ここまでできていればOKチェック**
+
+* [ ] Cloud Run URLが取得できた
+* [ ] Stripe本番WebhookがCloud Runに向いている
+
+---
+
+## 09_E2Eテスト手順
+
+**やること**: テストモードで購入→OAuth→ロール付与→解約→ロール剥奪
+**成果物**: 一連の自動化が動くことを確認
+
+### 9.1 ローカルでテスト（Webhook転送）
+
+```bash
+# 1) ローカル起動
+cp .env.example .env  # 値を入れる
+npm run dev
+
+# 2) Webhook転送
+npm run stripe:forward
+
+# 3) テスト用Checkout Sessionを作成（Stripe CLI）
+stripe checkout sessions create \
+  --mode subscription \
+  --line-items price=$STRIPE_PRICE_ID_MONTHLY_TEST,quantity=1 \
+  --success-url "http://localhost:8080/success?code={CHECKOUT_SESSION_ID}" \
+  --cancel-url "http://localhost:8080/"
+
+# 出力の url をブラウザで開き決済 → サンクスページから「サーバ参加」→「Discord連携」
+```
+
+**成功判定**
+
+* Stripe CLI 側ログ: `--> POST /stripe/webhook [200]`
+* ブラウザ：`Discord連携が完了しました` と表示
+* Discordサーバ：対象ユーザーに `@pro` が付与
+
+### 9.2 解約（テスト）
+
+* `/success?code=...` → 「請求管理（解約はこちら）」→ 解約
+* Webhookで `customer.subscription.updated` or `deleted` が到来 → ロール剥奪
+
+**ここまでできていればOKチェック**
+
+* [ ] 決済→連携で `@pro` が付与された
+* [ ] 解約で `@pro` が剥奪された
+
+---
+
+## 10_運用・監視・再同期ジョブ
+
+**やること**: Cloud Schedulerで毎日再同期、ログ確認、指標の見方
+**成果物**: アラが出ても自動復旧できる運用
+
+### 10.1 再同期ジョブ（1日1回）
+
+```bash
+SERVICE_URL=$(gcloud run services describe "$SERVICE_NAME" --region "$REGION" --format 'value(status.url)')
+
+gcloud scheduler jobs create http "${SERVICE_NAME}-resync-daily" \
+  --location="$REGION" \
+  --schedule="0 6 * * *" \
+  --time-zone="Asia/Tokyo" \
+  --uri="${SERVICE_URL}/admin/resync" \
+  --http-method=POST \
+  --headers="X-CRON-SECRET=$SCHEDULER_TOKEN"
+```
+
+### 10.2 ログ/監視（CLI）
+
+```bash
+# 直近ログ
+gcloud logging read \
+  'resource.type="cloud_run_revision" AND resource.labels.service_name="'$SERVICE_NAME'"' \
+  --limit=50 --freshness=1h --format='value(textPayload)'
+
+# リアルタイム tail
+gcloud beta logging tail \
+  'resource.type="cloud_run_revision" AND resource.labels.service_name="'$SERVICE_NAME'"'
+```
+
+**見るポイント**
+
+* Webhook 受信時：`[webhook] saved link code ...` / `webhook_sub entitle=...`
+* OAuth 連携時：`add role @pro` or `remove role @pro`
+
+**ここまでできていればOKチェック**
+
+* [ ] Schedulerジョブが作成された（一覧に出る）
+* [ ] ログで受信/付与/剥奪が追える
+
+---
+
+## 11_返金/解約方針テンプレ
+
+**やること**: 公開ポリシー文面を決める
+**成果物**: そのまま使える最短テンプレ
+
+> **返金/解約ポリシー（サンプル）**
+>
+> * 課金は前払いです。期間途中での解約でも日割り返金はありません。
+> * サブスクリプションはいつでも解約できます。解約後は即時に`@pro`ロールは剥奪されます。
+> * 誤課金等の明確なシステム不具合が認められる場合は個別に返金対応します。
+> * 為替の影響は受けません（JPY固定）。
+
+**ここまでできていればOKチェック**
+
+* [ ] 自社の運用に合うか最終チェック済み
+
+---
+
+## 12_トラブルシュートとFAQ（自己解決ガイド）
+
+**やること**: 失敗時の切り分けと即時復旧
+**成果物**: 現場で詰まらないための手順
+
+### A. Stripe Webhook署名検証失敗（400）
+
+* **症状**: Stripeイベントが200でなく400
+* **原因**: `STRIPE_WEBHOOK_SECRET_(TEST|LIVE)` の取り違い / `STRIPE_MODE` 不一致
+* **対処**:
+
+  1. ログで `signature verification failed` を確認
+  2. Secretの値と `STRIPE_MODE` を見直し
+  3. `stripe listen` 再実行（テスト時）
+
+### B. ロール付与不可（権限/並び順）
+
+* **症状**: ログに `member.roles.add` 失敗
+* **原因**: Botの権限不足（Manage Roles未付与）、またはBotロールが`@pro`より下
+* **対処**:
+
+  * サーバ設定で Botロールを `@pro` より**上**にドラッグ
+  * 権限に **Manage Roles** を付与
+
+### C. Webhook取りこぼし
+
+* **症状**: 解約したのにロールが残る
+* **対処**: `/admin/resync`（SchedulerのHTTP）を手動実行 → 全ユーザー再評価
+
+### D. ユーザーがサーバ未参加
+
+* **症状**: 連携後も付与されない（ログに Unknown Member）
+* **対処**: サンクスページの「サーバに参加」→ 連携 → 1分待って再確認
+
+### E. 時差/為替メモ
+
+* 本設計はJPY固定。為替影響なし。
+* Scheduler は `Asia/Tokyo` で設定済み。
+
+**ここまでできていればOKチェック**
+
+* [ ] 各失敗ケースの対処がわかった
+* [ ] 最悪でも再同期で直せる理解がある
+
+---
+
+## 付録：.envテンプレ（ローカル検証用）
+
+※ 4.3に全文あり。`.env.example` を `.env` にコピーして値を入れる。
+
+---
+
+## 付録：成功/失敗時の画面例テキスト（目視確認用）
+
+* **成功**: 「Discord連携が完了しました」「@pro ロールを付与しました」
+* **失敗**: 「OAuth link failed」「invalid state」「customer not found」
+
+---
+
+## Stripe 本番切替手順（明示）
+
+**やること**: テスト→本番切替
+**成果物**: ライブ決済で同じフローが稼働
+
+```bash
+# 1) 本番用の値をSecretに追加
+echo -n "<sk_live_...>" | gcloud secrets versions add STRIPE_SECRET_KEY_LIVE --data-file=-
+echo -n "<whsec_live_...>" | gcloud secrets versions add STRIPE_WEBHOOK_SECRET_LIVE --data-file=-
+echo -n "<price_month_live>" | gcloud secrets versions add STRIPE_PRICE_ID_MONTHLY_LIVE --data-file=-
+echo -n "<price_year_live>"  | gcloud secrets versions add STRIPE_PRICE_ID_YEARLY_LIVE --data-file=-
+
+# 2) モード切替（STRIPE_MODE=live）
+echo -n "live" | gcloud secrets versions add STRIPE_MODE --data-file=-
+
+# 3) 再デプロイ
+npm run deploy
+
+# 4) StripeダッシュボードのWebhookエンドポイントが
+#    https://<CloudRunURL>/stripe/webhook になっていることを確認
+```
+
+---
+
+# ここまでの「OK最終チェック」
+
+* [ ] ローカルで `stripe listen` → 200
+* [ ] Cloud Run URLでWebhook 200
+* [ ] Discord連携で `@pro` 付与
+* [ ] 解約で `@pro` 剥奪
+* [ ] `/admin/resync` が成功する
+
+---
+
+## 本番切替チェックリスト（5分版）
+
+**取り違い防止の最終確認だけやればOK。**
+
+1. **Stripeモード**
+
+   * [ ] `STRIPE_MODE=live`（Secret最新）
+   * [ ] `STRIPE_SECRET_KEY_LIVE` / `STRIPE_WEBHOOK_SECRET_LIVE` 入力済み
+   * [ ] `STRIPE_PRICE_ID_MONTHLY_LIVE` / `STRIPE_PRICE_ID_YEARLY_LIVE` 入力済み
+
+2. **Discord**
+
+   * [ ] `DISCORD_BOT_TOKEN` 正しい（本番Botならそれ）
+   * [ ] `DISCORD_GUILD_ID` / `DISCORD_PRO_ROLE_ID` 本番サーバの値
+   * [ ] Botロールが `@pro` より上
+
+3. **Cloud Run / Secret**
+
+   * [ ] `npm run deploy` 実行済み
+   * [ ] サービスURL控えた → Discord OAuthのRedirect URIに `.../oauth/discord/callback` を登録
+
+4. **Stripe Webhook**
+
+   * [ ] エンドポイント：`https://<SERVICE_URL>/stripe/webhook`
+   * [ ] テスト送信で**200**（Stripeの「Send test event」でも確認）
+
+5. **E2Eハンド試験（1名でOK）**
+
+   * [ ] 決済→サンクス→サーバ参加→連携で `@pro`
+   * [ ] ポータルから解約→数秒〜1分で剥奪
+   * [ ] `/admin/resync` 実行で整合
+
+---
+
+**完了です。**
+本ドキュメントは外部参照不要・質問禁止前提で完走できるように構成しています。セキュリティ（Webhook署名検証、OAuth最小スコープ、Secrets管理）、運用（再同期・ログ）まで含め、即実戦投入できます。
