@@ -8,7 +8,7 @@ const { Firestore } = require('@google-cloud/firestore');
 const { Client, GatewayIntentBits, Partials } = require('discord.js');
 
 // Discord招待リンクの既定値
-const DEFAULT_DISCORD_INVITE_URL = 'https://discord.gg/87fs9DxDyv';
+const DEFAULT_DISCORD_INVITE_URL = 'https://discord.gg/22Ah4EypVK';
 
 // ------- 環境変数の取得と整形 -------
 const CFG = {
@@ -18,12 +18,14 @@ const CFG = {
   STRIPE_WEBHOOK_SECRET_TEST: process.env.STRIPE_WEBHOOK_SECRET_TEST || '',
   STRIPE_PRICE_ID_MONTHLY_TEST: process.env.STRIPE_PRICE_ID_MONTHLY_TEST || '',
   STRIPE_PRICE_ID_YEARLY_TEST: process.env.STRIPE_PRICE_ID_YEARLY_TEST || '',
+  STRIPE_PRICE_ID_STUDENT_TEST: process.env.STRIPE_PRICE_ID_STUDENT_TEST || '',
   STRIPE_ADDITIONAL_PRICE_IDS_TEST: process.env.STRIPE_ADDITIONAL_PRICE_IDS_TEST || '',
 
   STRIPE_SECRET_KEY_LIVE: process.env.STRIPE_SECRET_KEY_LIVE || '',
   STRIPE_WEBHOOK_SECRET_LIVE: process.env.STRIPE_WEBHOOK_SECRET_LIVE || '',
   STRIPE_PRICE_ID_MONTHLY_LIVE: process.env.STRIPE_PRICE_ID_MONTHLY_LIVE || '',
   STRIPE_PRICE_ID_YEARLY_LIVE: process.env.STRIPE_PRICE_ID_YEARLY_LIVE || '',
+  STRIPE_PRICE_ID_STUDENT_LIVE: process.env.STRIPE_PRICE_ID_STUDENT_LIVE || '',
   STRIPE_ADDITIONAL_PRICE_IDS_LIVE: process.env.STRIPE_ADDITIONAL_PRICE_IDS_LIVE || '',
 
   DISCORD_CLIENT_ID: process.env.DISCORD_CLIENT_ID || '',
@@ -75,6 +77,7 @@ const STRIPE_WEBHOOK_SECRET = modePick(CFG.STRIPE_WEBHOOK_SECRET_TEST, CFG.STRIP
 const PRICE_IDS = {
   monthly: modePick(CFG.STRIPE_PRICE_ID_MONTHLY_TEST, CFG.STRIPE_PRICE_ID_MONTHLY_LIVE),
   yearly: modePick(CFG.STRIPE_PRICE_ID_YEARLY_TEST, CFG.STRIPE_PRICE_ID_YEARLY_LIVE),
+  student: modePick(CFG.STRIPE_PRICE_ID_STUDENT_TEST, CFG.STRIPE_PRICE_ID_STUDENT_LIVE),
   extra: modePick(
     parsePriceList(CFG.STRIPE_ADDITIONAL_PRICE_IDS_TEST),
     parsePriceList(CFG.STRIPE_ADDITIONAL_PRICE_IDS_LIVE)
@@ -84,6 +87,7 @@ const PRICE_IDS = {
 const ENTITLED_PRICE_IDS = new Set([
   PRICE_IDS.monthly,
   PRICE_IDS.yearly,
+  PRICE_IDS.student,
   ...PRICE_IDS.extra
 ].filter(Boolean));
 
@@ -183,6 +187,10 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
 // 一般JSONは通常のparser
 app.use(express.json());
 
+// 静的ファイル配信（ロゴ等）
+const path = require('path');
+app.use('/public', express.static(path.join(__dirname, 'public')));
+
 // ---- ヘルス & ルート ----
 app.get('/healthz', (_req, res) => res.send('ok'));
 
@@ -271,7 +279,7 @@ app.get('/', (_req, res) => {
     <div class="feature">Pro限定チャンネルアクセス</div>
     <div class="feature">専用サポート</div>
     <div class="feature">月額 ¥5,000</div>
-    <div class="feature">30日間無料トライアル</div>
+    <div class="feature" style="color: #28a745; font-weight: 600;">学生は月額 ¥2,000（.ac.jp / .edu / .ed.jp）</div>
     <div class="feature">いつでも解約可能</div>
   </div>
 
@@ -287,7 +295,7 @@ app.get('/', (_req, res) => {
       >
     </div>
     <button type="submit" class="btn primary" id="checkout-btn">
-      今すぐ参加（30日間無料）
+      今すぐ参加
     </button>
     <div id="error-message" style="color: #dc3545; margin-top: 16px; display: none;"></div>
     <div id="warning-message" style="color: #ff9800; margin-top: 16px; display: none;"></div>
@@ -321,7 +329,7 @@ app.get('/', (_req, res) => {
           errorDiv.textContent = data.message || 'エラーが発生しました';
           errorDiv.style.display = 'block';
           btn.disabled = false;
-          btn.textContent = '今すぐ参加（30日間無料）';
+          btn.textContent = '今すぐ参加';
           return;
         }
 
@@ -337,7 +345,7 @@ app.get('/', (_req, res) => {
         errorDiv.textContent = 'ネットワークエラーが発生しました';
         errorDiv.style.display = 'block';
         btn.disabled = false;
-        btn.textContent = '今すぐ参加（30日間無料）';
+        btn.textContent = '今すぐ参加';
       }
     });
   </script>
@@ -768,9 +776,16 @@ app.post('/api/create-checkout-session', async (req, res) => {
     return res.status(400).json({ error: 'Email is required' });
   }
 
-  // priceIdのデフォルトは月額プラン
-  const selectedPriceId = priceId || PRICE_IDS.monthly;
+  // 学生ドメインチェック
+  const isStudent = isStudentEmail(email);
+
+  // priceIdのデフォルトは学生ドメインなら学生プラン、そうでなければ月額プラン
+  const selectedPriceId = priceId || (isStudent ? PRICE_IDS.student : PRICE_IDS.monthly);
   const checkoutMode = mode || 'subscription';
+
+  if (isStudent) {
+    console.log(`[checkout] Student email detected: ${email}, using student price`);
+  }
 
   try {
     // 1. 既存のCustomerを検索
@@ -804,9 +819,9 @@ app.post('/api/create-checkout-session', async (req, res) => {
         });
       }
 
-      // 3. トライアル再利用チェック
+      // 3. トライアル再利用チェック（クーポン利用時のため保持）
       if (hasCustomerUsedTrial(customer)) {
-        warnings.push('このメールアドレスは既に無料トライアルを利用しています。今回は通常価格での契約となります。');
+        warnings.push('このメールアドレスは既に無料トライアルを利用しています。クーポンを使用した場合も通常価格での契約となります。');
         console.log(`[checkout] Customer ${customer.id} has already used trial`);
       }
     } else {
@@ -832,16 +847,10 @@ app.post('/api/create-checkout-session', async (req, res) => {
       }
     };
 
-    // トライアル設定: 既存CustomerでトライアルONLY使用済みの場合はトライアルなし
-    if (customer && hasCustomerUsedTrial(customer)) {
-      // トライアルなしで即課金
+    // トライアル設定: デフォルトではトライアルなし（クーポンで対応）
+    if (checkoutMode === 'subscription') {
       sessionParams.subscription_data = {
         trial_period_days: 0
-      };
-    } else if (checkoutMode === 'subscription') {
-      // 新規Customerまたはトライアル未使用の場合、30日間のトライアルを提供
-      sessionParams.subscription_data = {
-        trial_period_days: 30
       };
     }
 
@@ -1274,6 +1283,13 @@ app.get('/admin/create-invite', async (req, res) => {
 
 // ------- ユーティリティ -------
 
+function isStudentEmail(email) {
+  if (!email) return false;
+  const emailLower = email.toLowerCase();
+  const studentDomains = ['.ac.jp', '.edu', '.ed.jp'];
+  return studentDomains.some(domain => emailLower.endsWith(domain));
+}
+
 function getBaseUrl(req) {
   const proto = (req.headers['x-forwarded-proto'] || 'http').split(',')[0];
   const host = (req.headers['x-forwarded-host'] || req.headers['host']);
@@ -1362,18 +1378,82 @@ async function isCustomerEntitled(customerId) {
 async function handleSubChange(subscription) {
   const customerId = subscription.customer;
   const entitled = await isCustomerEntitled(customerId);
+  const linkedDiscordIds = [];
 
   // customerId -> discord user を解決
   const usersSnap = await firestore.collection('users').where('customerId', '==', customerId).get();
   if (usersSnap.empty) {
     // 未連携の可能性：linkCodesに保存してあるため、後でOAuth完了時に同期される
     console.log('[subChange] no linked discord user yet for customer:', customerId);
+  } else {
+    for (const doc of usersSnap.docs) {
+      const discordUserId = doc.id;
+      linkedDiscordIds.push(discordUserId);
+      await ensureRole(discordUserId, entitled, `webhook_sub entitle=${entitled}`);
+      await doc.ref.set({ updatedAt: Date.now() }, { merge: true });
+    }
+  }
+
+  await upsertStripeCustomerSnapshot(subscription, {
+    entitled,
+    discordUserIds: linkedDiscordIds,
+  });
+}
+
+async function upsertStripeCustomerSnapshot(subscription, options = {}) {
+  if (!firestore) {
+    console.warn('[stripeCustomer] firestore not initialized, skipping snapshot');
     return;
   }
-  for (const doc of usersSnap.docs) {
-    const discordUserId = doc.id;
-    await ensureRole(discordUserId, entitled, `webhook_sub entitle=${entitled}`);
-    await doc.ref.set({ updatedAt: Date.now() }, { merge: true });
+  try {
+    const customerId = typeof subscription.customer === 'string'
+      ? subscription.customer
+      : subscription.customer?.id;
+    if (!customerId) {
+      console.warn('[stripeCustomer] missing customer id');
+      return;
+    }
+
+    let customerEmail = null;
+    let orgId = subscription.metadata?.orgId || null;
+    try {
+      const customer = await stripe.customers.retrieve(customerId);
+      customerEmail = customer.email || null;
+      if (!orgId && customer.metadata?.orgId) {
+        orgId = customer.metadata.orgId;
+      }
+    } catch (err) {
+      console.error('[stripeCustomer] failed to fetch customer', err?.message || err);
+    }
+
+    const priceNames = subscription.items?.data?.map((item) => {
+      if (!item?.price) return null;
+      return item.price.nickname || item.price.id;
+    }).filter(Boolean) || [];
+
+    const priceIds = subscription.items?.data?.map((item) => item?.price?.id).filter(Boolean) || [];
+
+    const payload = {
+      customerId,
+      orgId: orgId || null,
+      subscriptionId: subscription.id,
+      status: subscription.status,
+      cancelAtPeriodEnd: Boolean(subscription.cancel_at_period_end),
+      currentPeriodEnd: subscription.current_period_end ? subscription.current_period_end * 1000 : null,
+      priceIds,
+      productNames: priceNames,
+      email: customerEmail,
+      entitled: Boolean(options.entitled),
+      updatedAt: Date.now(),
+    };
+
+    if (Array.isArray(options.discordUserIds) && options.discordUserIds.length > 0) {
+      payload.linkedDiscordUserIds = options.discordUserIds;
+    }
+
+    await firestore.collection('stripe_customers').doc(customerId).set(payload, { merge: true });
+  } catch (err) {
+    console.error('[stripeCustomer] upsert error:', err?.message || err);
   }
 }
 
@@ -1403,6 +1483,340 @@ async function ensureRole(discordUserId, shouldHaveRole, reason) {
     console.log(`[discord] role up-to-date (${shouldHaveRole ? 'keep' : 'no-role'}) for ${discordUserId}`);
   }
 }
+
+// ------- AI FES. 購入ページ -------
+app.get('/aifes', (req, res) => {
+  const html = `
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI FES. 2026 | AI×建築の祭典</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Hiragino Sans', 'Hiragino Kaku Gothic ProN', Meiryo, sans-serif;
+      background: linear-gradient(135deg, #e0f7fa 0%, #e3f2fd 50%, #ede7f6 100%);
+      min-height: 100vh;
+      padding: 40px 20px;
+      color: #333;
+    }
+    .container { max-width: 640px; margin: 0 auto; }
+    .header {
+      background: linear-gradient(135deg, #4dd0e1 0%, #29b6f6 50%, #42a5f5 100%);
+      padding: 48px 40px;
+      text-align: center;
+      border-radius: 16px 16px 0 0;
+      position: relative;
+      overflow: hidden;
+    }
+    .header::before {
+      content: '';
+      position: absolute;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle cx="20" cy="20" r="2" fill="rgba(255,255,255,0.1)"/><circle cx="80" cy="40" r="3" fill="rgba(255,255,255,0.1)"/><circle cx="40" cy="80" r="2" fill="rgba(255,255,255,0.1)"/></svg>');
+    }
+    .logo { width: 80px; height: 80px; margin-bottom: 16px; filter: drop-shadow(0 4px 8px rgba(0,0,0,0.1)); }
+    .header h1 { font-size: 32px; font-weight: 700; color: white; letter-spacing: 6px; margin-bottom: 8px; text-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    .header .date { font-size: 16px; color: rgba(255,255,255,0.95); letter-spacing: 2px; font-weight: 500; }
+    .header .subtitle { font-size: 13px; color: rgba(255,255,255,0.8); margin-top: 8px; }
+    .content {
+      background: white;
+      padding: 40px;
+      border-radius: 0 0 16px 16px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.08);
+    }
+    .member-notice {
+      background: linear-gradient(135deg, #e0f7fa, #e3f2fd);
+      border: 1px solid #80deea;
+      border-radius: 12px;
+      padding: 20px 24px;
+      margin-bottom: 32px;
+    }
+    .member-notice h3 { font-size: 14px; font-weight: 600; color: #00838f; margin-bottom: 8px; }
+    .member-notice p { font-size: 13px; color: #006064; line-height: 1.7; }
+    .notice {
+      background: #fafafa;
+      border-radius: 8px;
+      padding: 20px;
+      margin-bottom: 32px;
+      font-size: 13px;
+      line-height: 1.8;
+      color: #666;
+      border-left: 4px solid #4dd0e1;
+    }
+    .notice strong { color: #333; }
+    .section-title {
+      font-size: 14px;
+      font-weight: 700;
+      background: linear-gradient(135deg, #4dd0e1, #42a5f5);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      letter-spacing: 3px;
+      margin-bottom: 20px;
+      padding-bottom: 12px;
+      border-bottom: 2px solid #e0f7fa;
+    }
+    .product {
+      border: 1px solid #e0e0e0;
+      border-radius: 12px;
+      padding: 24px;
+      margin-bottom: 16px;
+      transition: all 0.3s ease;
+      background: white;
+    }
+    .product:hover {
+      border-color: #4dd0e1;
+      box-shadow: 0 4px 16px rgba(77,208,225,0.15);
+      transform: translateY(-2px);
+    }
+    .product-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px; }
+    .product h3 { font-size: 15px; font-weight: 600; color: #333; flex: 1; padding-right: 16px; }
+    .product .price { font-size: 20px; font-weight: 700; background: linear-gradient(135deg, #4dd0e1, #42a5f5); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; white-space: nowrap; }
+    .product .desc { font-size: 13px; color: #888; line-height: 1.6; margin-bottom: 16px; }
+    .product a {
+      display: inline-block;
+      padding: 12px 28px;
+      background: linear-gradient(135deg, #4dd0e1 0%, #29b6f6 100%);
+      color: white;
+      text-decoration: none;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      transition: all 0.3s ease;
+      box-shadow: 0 2px 8px rgba(77,208,225,0.3);
+    }
+    .product a:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 4px 12px rgba(77,208,225,0.4);
+    }
+    .product.featured {
+      border: 2px solid #4dd0e1;
+      position: relative;
+      background: linear-gradient(135deg, rgba(224,247,250,0.3), rgba(227,242,253,0.3));
+    }
+    .product.featured::before {
+      content: 'BEST';
+      position: absolute;
+      top: -10px;
+      left: 20px;
+      background: linear-gradient(135deg, #4dd0e1, #42a5f5);
+      color: white;
+      font-size: 10px;
+      font-weight: 700;
+      padding: 4px 14px;
+      border-radius: 4px;
+      letter-spacing: 2px;
+    }
+    .divider { height: 2px; background: linear-gradient(90deg, transparent, #e0f7fa, transparent); margin: 40px 0; }
+
+    /* Schedule Section */
+    .schedule { margin-bottom: 40px; }
+    .schedule-block { margin-bottom: 24px; }
+    .schedule-block h4 {
+      font-size: 13px;
+      font-weight: 600;
+      color: #00838f;
+      background: #e0f7fa;
+      padding: 10px 16px;
+      border-radius: 8px;
+      margin-bottom: 12px;
+    }
+    .schedule-item {
+      display: flex;
+      padding: 8px 0;
+      border-bottom: 1px solid #f5f5f5;
+      font-size: 13px;
+    }
+    .schedule-item:last-child { border-bottom: none; }
+    .schedule-time { width: 110px; color: #4dd0e1; font-weight: 600; flex-shrink: 0; }
+    .schedule-title { color: #333; flex: 1; }
+    .schedule-break { color: #999; font-style: italic; }
+
+    .circle-promo {
+      background: linear-gradient(135deg, #4dd0e1 0%, #29b6f6 50%, #42a5f5 100%);
+      border-radius: 16px;
+      padding: 36px;
+      color: white;
+      text-align: center;
+      position: relative;
+      overflow: hidden;
+    }
+    .circle-promo::before {
+      content: '';
+      position: absolute;
+      top: -50%; left: -50%;
+      width: 200%; height: 200%;
+      background: radial-gradient(circle, rgba(255,255,255,0.1) 0%, transparent 60%);
+    }
+    .circle-promo h3 { font-size: 18px; font-weight: 700; margin-bottom: 12px; position: relative; }
+    .circle-promo p { font-size: 14px; line-height: 1.8; opacity: 0.95; margin-bottom: 20px; position: relative; }
+    .circle-promo .benefits {
+      text-align: left;
+      background: rgba(255,255,255,0.15);
+      border-radius: 12px;
+      padding: 20px 24px;
+      margin-bottom: 24px;
+      font-size: 14px;
+      line-height: 2;
+      position: relative;
+    }
+    .circle-promo a {
+      display: inline-block;
+      padding: 16px 40px;
+      background: white;
+      color: #00838f;
+      text-decoration: none;
+      border-radius: 12px;
+      font-size: 15px;
+      font-weight: 700;
+      transition: all 0.3s ease;
+      position: relative;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+    }
+    .circle-promo a:hover {
+      transform: translateY(-3px);
+      box-shadow: 0 6px 20px rgba(0,0,0,0.2);
+    }
+    .footer {
+      margin-top: 32px;
+      padding-top: 24px;
+      border-top: 1px solid #eee;
+      font-size: 12px;
+      color: #999;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <img src="/public/aifes-logo.png" alt="AI FES." class="logo">
+      <h1>AI FES.</h1>
+      <p class="date">2026.1.25 SAT / ONLINE</p>
+      <p class="subtitle">AI×建築の祭典</p>
+    </div>
+    <div class="content">
+      <!-- サークル入会（最上部に配置） -->
+      <div class="circle-promo" style="margin-bottom: 32px;">
+        <div style="background: rgba(255,255,255,0.2); border-radius: 8px; padding: 12px 20px; margin-bottom: 20px; display: inline-block;">
+          <span style="font-size: 24px; font-weight: 800;">¥9,800</span>
+          <span style="font-size: 14px; text-decoration: line-through; opacity: 0.7; margin: 0 8px;">→</span>
+          <span style="font-size: 28px; font-weight: 800;">¥0</span>
+        </div>
+        <h3 style="font-size: 20px; margin-bottom: 16px;">サークル会員なら AI FES. 無料！</h3>
+        <p style="font-size: 15px; margin-bottom: 24px;">
+          月額 <strong style="font-size: 20px;">¥5,000</strong> で今回のAI FES.（¥9,800相当）に<br>
+          <strong>無料</strong>で参加できます。
+        </p>
+        <div class="benefits">
+          ✓ <strong>AI FES. 無料参加</strong>（¥9,800相当）<br>
+          ✓ 会員限定Discordコミュニティ<br>
+          ✓ 過去セミナーアーカイブ視聴<br>
+          ✓ 毎月のAI×建築コンテンツ
+        </div>
+        <a href="https://buy.stripe.com/dRm00l0J75OR3eV8Cbf7i00" target="_blank">サークルに入会する（月額¥5,000）</a>
+        <p style="font-size: 12px; margin-top: 16px; opacity: 0.8;">入会後、AI FES.無料クーポンがメールで届きます</p>
+      </div>
+
+      <div class="member-notice">
+        <h3>既にサークル会員の方へ</h3>
+        <p>会員様には専用クーポンをメールでお送りしています。<br>メールに記載のコードで無料参加できます。</p>
+      </div>
+
+      <div class="divider"></div>
+
+      <div class="notice">
+        <strong>単発チケット購入の方へ</strong><br>
+        購入時のメールアドレスでZoom登録されます。<br>
+        異なるメールアドレスでは参加できません。
+      </div>
+
+      <h2 class="section-title">TICKETS（単発購入）</h2>
+
+      <div class="product featured">
+        <div class="product-header">
+          <h3>1日通しチケット</h3>
+          <div class="price">¥9,800</div>
+        </div>
+        <div class="desc">全プログラム参加可能（10:00〜22:00）</div>
+        <a href="https://buy.stripe.com/aFacN7ezX6SV8zfcSrf7i03" target="_blank">購入する</a>
+      </div>
+
+      <div class="product">
+        <div class="product-header">
+          <h3>実務で使えるAI×建築セミナー</h3>
+          <div class="price">¥5,000</div>
+        </div>
+        <div class="desc">AIを建築実務で活用する実践講座（13:35〜16:00）</div>
+        <a href="https://buy.stripe.com/14A00lezX4KNdTz5pZf7i04" target="_blank">購入する</a>
+      </div>
+
+      <div class="product">
+        <div class="product-header">
+          <h3>画像生成AIセミナー</h3>
+          <div class="price">¥4,000</div>
+        </div>
+        <div class="desc">建築パース制作に使える画像生成AI実践講座（16:00〜17:30）</div>
+        <a href="https://buy.stripe.com/5kQ9AVcrP1yB5n3aKjf7i05" target="_blank">購入する</a>
+      </div>
+
+      <div class="product">
+        <div class="product-header">
+          <h3>無料HP＆GAS自動化セミナー</h3>
+          <div class="price">¥3,000</div>
+        </div>
+        <div class="desc">Googleサービスで作るHP＆業務自動化（20:00〜21:00）</div>
+        <a href="https://buy.stripe.com/7sY9AVcrP6SV4iZf0zf7i06" target="_blank">購入する</a>
+      </div>
+
+      <div class="divider"></div>
+
+      <h2 class="section-title">TIME SCHEDULE</h2>
+      <div class="schedule">
+        <div class="schedule-block">
+          <h4>午前：視界を広げる</h4>
+          <div class="schedule-item"><span class="schedule-time">10:00–10:15</span><span class="schedule-title">オープニング</span></div>
+          <div class="schedule-item"><span class="schedule-time">10:15–11:30</span><span class="schedule-title">最新AI Newsまとめ</span></div>
+          <div class="schedule-item"><span class="schedule-time">11:30–11:45</span><span class="schedule-title schedule-break">休憩</span></div>
+          <div class="schedule-item"><span class="schedule-time">11:45–12:35</span><span class="schedule-title">GAS＆業務自動化</span></div>
+        </div>
+
+        <div class="schedule-block">
+          <h4>午後前半：基礎を固める</h4>
+          <div class="schedule-item"><span class="schedule-time">12:35–13:35</span><span class="schedule-title schedule-break">お昼休み</span></div>
+          <div class="schedule-item"><span class="schedule-time">13:35–14:35</span><span class="schedule-title">第２回実務AI×建築セミナー（基本・使い分け）</span></div>
+          <div class="schedule-item"><span class="schedule-time">14:35–14:45</span><span class="schedule-title schedule-break">休憩</span></div>
+          <div class="schedule-item"><span class="schedule-time">14:45–15:45</span><span class="schedule-title">第２回実務AI×建築セミナー（実践）</span></div>
+          <div class="schedule-item"><span class="schedule-time">15:45–16:00</span><span class="schedule-title schedule-break">休憩</span></div>
+        </div>
+
+        <div class="schedule-block">
+          <h4>午後後半：実践＆製品デモ</h4>
+          <div class="schedule-item"><span class="schedule-time">16:00–17:30</span><span class="schedule-title">第２回今使える画像生成AIセミナー</span></div>
+          <div class="schedule-item"><span class="schedule-time">17:30–18:30</span><span class="schedule-title">自社製品デモ（COMPASS/SpotPDF/KAKOME）</span></div>
+          <div class="schedule-item"><span class="schedule-time">18:30–18:50</span><span class="schedule-title">質問タイム（画像生成＆製品）</span></div>
+        </div>
+
+        <div class="schedule-block">
+          <h4>夜の部：交流とボーナス</h4>
+          <div class="schedule-item"><span class="schedule-time">18:50–20:00</span><span class="schedule-title schedule-break">夕食休憩</span></div>
+          <div class="schedule-item"><span class="schedule-time">20:00–21:00</span><span class="schedule-title">第１回無料HP＆GAS自動化セミナー</span></div>
+          <div class="schedule-item"><span class="schedule-time">21:00–21:30</span><span class="schedule-title">プレゼント配布＋AI×建築サークル案内</span></div>
+          <div class="schedule-item"><span class="schedule-time">21:30–22:00</span><span class="schedule-title">グランドフィナーレ</span></div>
+        </div>
+      </div>
+
+      <div class="footer">ご不明点はお問い合わせください</div>
+    </div>
+  </div>
+</body>
+</html>
+  `;
+  res.type('html').send(html);
+});
 
 // ------- サーバ起動 -------
 app.listen(PORT, () => {
