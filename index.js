@@ -6,6 +6,7 @@ const crypto = require('crypto');
 const Stripe = require('stripe');
 const { Firestore } = require('@google-cloud/firestore');
 const { Client, GatewayIntentBits, Partials } = require('discord.js');
+const { aifesPageHTML } = require('./aifes_page');
 
 // Discord招待リンクの既定値
 const DEFAULT_DISCORD_INVITE_URL = 'https://discord.gg/22Ah4EypVK';
@@ -154,6 +155,17 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
         // code = session.id を success_url で渡す設計
         await saveLinkCode(session.id, session.customer);
         console.log(`[webhook] saved link code for session ${session.id}, customer ${session.customer}`);
+
+        // 会社名が入力されていたら顧客名を更新（領収書用）
+        if (session.custom_fields && session.custom_fields.length > 0) {
+          const companyField = session.custom_fields.find(f => f.key === 'company_name');
+          if (companyField && companyField.text && companyField.text.value) {
+            await stripe.customers.update(session.customer, {
+              name: companyField.text.value
+            });
+            console.log(`[webhook] updated customer name to: ${companyField.text.value}`);
+          }
+        }
         break;
       }
       case 'customer.subscription.created': {
@@ -840,6 +852,18 @@ app.post('/api/create-checkout-session', async (req, res) => {
           quantity: 1
         }
       ],
+      billing_address_collection: 'required',
+      custom_fields: [
+        {
+          key: 'company_name',
+          label: {
+            type: 'custom',
+            custom: '会社名（入力すると領収書の宛名になります）'
+          },
+          type: 'text',
+          optional: true
+        }
+      ],
       success_url: `${base}/success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${base}/?canceled=true`,
       metadata: {
@@ -1486,6 +1510,11 @@ async function ensureRole(discordUserId, shouldHaveRole, reason) {
 
 // ------- AI FES. 購入ページ -------
 app.get('/aifes', (req, res) => {
+  res.type('html').send(aifesPageHTML);
+});
+
+// ------- 旧AI FES.ページ（削除予定） -------
+app.get('/aifes-old', (req, res) => {
   const html = `
 <!DOCTYPE html>
 <html lang="ja">
@@ -1575,7 +1604,8 @@ app.get('/aifes', (req, res) => {
     .product-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px; }
     .product h3 { font-size: 15px; font-weight: 600; color: #333; flex: 1; padding-right: 16px; }
     .product .price { font-size: 20px; font-weight: 700; background: linear-gradient(135deg, #4dd0e1, #42a5f5); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; white-space: nowrap; }
-    .product .desc { font-size: 13px; color: #888; line-height: 1.6; margin-bottom: 16px; }
+    .product .desc { font-size: 13px; color: #888; line-height: 1.6; margin-bottom: 8px; }
+    .product .desc-sub { font-size: 12px; color: #29b6f6; margin-bottom: 16px; font-weight: 500; }
     .product a {
       display: inline-block;
       padding: 12px 28px;
@@ -1611,6 +1641,153 @@ app.get('/aifes', (req, res) => {
       letter-spacing: 2px;
     }
     .divider { height: 2px; background: linear-gradient(90deg, transparent, #e0f7fa, transparent); margin: 40px 0; }
+
+    /* 共通セッションボックス */
+    .common-session-box {
+      background: #f8fafb;
+      border: 1px solid #e8eef1;
+      border-radius: 12px;
+      padding: 20px;
+      margin-bottom: 24px;
+    }
+    .common-session-header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .common-badge {
+      background: #1a1a1a;
+      color: white;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 4px 10px;
+      border-radius: 4px;
+    }
+    .common-title {
+      font-size: 13px;
+      color: #666;
+    }
+    .common-session-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .common-item {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 13px;
+    }
+    .common-time {
+      color: #999;
+      font-size: 12px;
+      width: 90px;
+      flex-shrink: 0;
+    }
+    .common-name {
+      color: #333;
+    }
+
+    /* チケットガイド */
+    .ticket-guide {
+      text-align: center;
+      font-size: 13px;
+      color: #999;
+      margin-bottom: 20px;
+    }
+
+    /* チケットグリッド */
+    .ticket-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 12px;
+    }
+    @media (max-width: 500px) {
+      .ticket-grid { grid-template-columns: 1fr; }
+    }
+    .ticket-card {
+      background: white;
+      border: 1px solid #e8eef1;
+      border-radius: 12px;
+      padding: 20px;
+      text-align: center;
+      transition: all 0.2s;
+    }
+    .ticket-card:hover {
+      border-color: #ccc;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.06);
+    }
+    .ticket-card.best {
+      border: 2px solid #1a1a1a;
+      position: relative;
+    }
+    .ticket-label {
+      position: absolute;
+      top: -10px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: #1a1a1a;
+      color: white;
+      font-size: 10px;
+      font-weight: 700;
+      padding: 3px 12px;
+      border-radius: 4px;
+      letter-spacing: 1px;
+    }
+    .ticket-name {
+      font-size: 15px;
+      font-weight: 600;
+      color: #1a1a1a;
+      margin-bottom: 8px;
+    }
+    .ticket-price {
+      font-size: 24px;
+      font-weight: 700;
+      color: #1a1a1a;
+      margin-bottom: 12px;
+    }
+    .ticket-includes {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      justify-content: center;
+      margin-bottom: 12px;
+    }
+    .include-tag {
+      font-size: 11px;
+      padding: 4px 8px;
+      border-radius: 4px;
+      background: #f0f0f0;
+      color: #666;
+    }
+    .include-tag.all {
+      background: #1a1a1a;
+      color: white;
+    }
+    .include-tag.common {
+      background: #e8eef1;
+      color: #666;
+    }
+    .ticket-time {
+      font-size: 11px;
+      color: #999;
+      margin-bottom: 16px;
+    }
+    .ticket-btn {
+      display: block;
+      padding: 10px 16px;
+      background: #1a1a1a;
+      color: white;
+      text-decoration: none;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 500;
+      transition: background 0.2s;
+    }
+    .ticket-btn:hover {
+      background: #333;
+    }
 
     /* Schedule Section */
     .schedule { margin-bottom: 40px; }
@@ -1701,24 +1878,63 @@ app.get('/aifes', (req, res) => {
     <div class="content">
       <!-- サークル入会（最上部に配置） -->
       <div class="circle-promo" style="margin-bottom: 32px;">
-        <div style="background: rgba(255,255,255,0.2); border-radius: 8px; padding: 12px 20px; margin-bottom: 20px; display: inline-block;">
-          <span style="font-size: 24px; font-weight: 800;">¥9,800</span>
-          <span style="font-size: 14px; text-decoration: line-through; opacity: 0.7; margin: 0 8px;">→</span>
-          <span style="font-size: 28px; font-weight: 800;">¥0</span>
+        <h3 style="font-size: 18px; margin-bottom: 20px; font-weight: 600;">サークル会員なら AI FES. 無料</h3>
+
+        <!-- 価格比較 -->
+        <div style="display: flex; align-items: center; justify-content: center; gap: 16px; margin-bottom: 24px;">
+          <div style="text-align: center;">
+            <p style="font-size: 11px; opacity: 0.7; margin: 0 0 4px 0;">単発購入</p>
+            <p style="font-size: 20px; font-weight: 700; margin: 0; text-decoration: line-through; opacity: 0.5;">¥9,800</p>
+          </div>
+          <span style="font-size: 24px;">→</span>
+          <div style="text-align: center;">
+            <p style="font-size: 11px; opacity: 0.7; margin: 0 0 4px 0;">会員価格</p>
+            <p style="font-size: 28px; font-weight: 800; margin: 0;">¥0</p>
+          </div>
         </div>
-        <h3 style="font-size: 20px; margin-bottom: 16px;">サークル会員なら AI FES. 無料！</h3>
-        <p style="font-size: 15px; margin-bottom: 24px;">
-          月額 <strong style="font-size: 20px;">¥5,000</strong> で今回のAI FES.（¥9,800相当）に<br>
-          <strong>無料</strong>で参加できます。
+
+        <!-- おすすめの使い方フロー -->
+        <div style="background: rgba(255,255,255,0.1); border-radius: 8px; padding: 20px 16px; margin-bottom: 20px;">
+          <p style="font-size: 13px; font-weight: 600; margin: 0 0 16px 0; opacity: 0.9;">おすすめの使い方</p>
+          <div style="display: flex; flex-direction: column; gap: 8px; font-size: 13px; text-align: left;">
+            <div style="display: flex; align-items: center; gap: 10px;">
+              <span style="background: white; color: #1a1a1a; width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; flex-shrink: 0;">1</span>
+              <span>サークルに入会</span>
+            </div>
+            <div style="margin-left: 9px; border-left: 2px solid rgba(255,255,255,0.3); height: 8px;"></div>
+            <div style="display: flex; align-items: center; gap: 10px;">
+              <span style="background: white; color: #1a1a1a; width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; flex-shrink: 0;">2</span>
+              <span>Compass・SpotPDF を試す / Discord参加</span>
+            </div>
+            <div style="margin-left: 9px; border-left: 2px solid rgba(255,255,255,0.3); height: 8px;"></div>
+            <div style="display: flex; align-items: center; gap: 10px;">
+              <span style="background: white; color: #1a1a1a; width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; flex-shrink: 0;">3</span>
+              <span>AI FES. 当日参加</span>
+            </div>
+            <div style="margin-left: 9px; border-left: 2px solid rgba(255,255,255,0.3); height: 8px;"></div>
+            <div style="display: flex; align-items: center; gap: 10px;">
+              <span style="background: white; color: #1a1a1a; width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; flex-shrink: 0;">4</span>
+              <span>アフターサポートも活用</span>
+            </div>
+            <div style="margin-left: 9px; border-left: 2px solid rgba(255,255,255,0.3); height: 8px;"></div>
+            <div style="display: flex; align-items: center; gap: 10px;">
+              <span style="background: white; color: #1a1a1a; width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; flex-shrink: 0;">5</span>
+              <span style="font-weight: 600;">継続 or 解約を判断</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 解約OK -->
+        <p style="font-size: 13px; margin: 0 0 20px 0; opacity: 0.9;">
+          <span style="background: rgba(255,255,255,0.2); padding: 4px 12px; border-radius: 4px;">解約要件なし・いつでも退会OK</span>
         </p>
-        <div class="benefits">
-          ✓ <strong>AI FES. 無料参加</strong>（¥9,800相当）<br>
-          ✓ 会員限定Discordコミュニティ<br>
-          ✓ 過去セミナーアーカイブ視聴<br>
-          ✓ 毎月のAI×建築コンテンツ
+
+        <!-- ボタン -->
+        <div style="display: flex; gap: 12px; justify-content: center; flex-wrap: wrap;">
+          <a href="https://suz-u3n-chu.github.io/AI-Architecture-Circle/" target="_blank" style="background: transparent; border: 1px solid rgba(255,255,255,0.4); padding: 12px 20px; font-size: 13px;">詳細を見る</a>
+          <a href="https://buy.stripe.com/dRm00l0J75OR3eV8Cbf7i00" target="_blank" style="padding: 12px 20px; font-size: 13px;">入会する（月額¥5,000）</a>
         </div>
-        <a href="https://buy.stripe.com/dRm00l0J75OR3eV8Cbf7i00" target="_blank">サークルに入会する（月額¥5,000）</a>
-        <p style="font-size: 12px; margin-top: 16px; opacity: 0.8;">入会後、AI FES.無料クーポンがメールで届きます</p>
+        <p style="font-size: 11px; margin-top: 12px; opacity: 0.6;">入会後、AI FES.無料クーポンがメールで届きます</p>
       </div>
 
       <div class="member-notice">
@@ -1728,48 +1944,84 @@ app.get('/aifes', (req, res) => {
 
       <div class="divider"></div>
 
-      <div class="notice">
-        <strong>単発チケット購入の方へ</strong><br>
-        購入時のメールアドレスでZoom登録されます。<br>
-        異なるメールアドレスでは参加できません。
-      </div>
-
       <h2 class="section-title">TICKETS（単発購入）</h2>
 
-      <div class="product featured">
-        <div class="product-header">
-          <h3>1日通しチケット</h3>
-          <div class="price">¥9,800</div>
+      <!-- 共通セッション説明 -->
+      <div class="common-session-box">
+        <div class="common-session-header">
+          <span class="common-badge">全チケット共通</span>
+          <span class="common-title">どのチケットでも視聴できます</span>
         </div>
-        <div class="desc">全プログラム参加可能（10:00〜22:00）</div>
-        <a href="https://buy.stripe.com/aFacN7ezX6SV8zfcSrf7i03" target="_blank">購入する</a>
+        <div class="common-session-list">
+          <div class="common-item">
+            <span class="common-time">10:15-11:30</span>
+            <span class="common-name">最新AI Newsまとめ</span>
+          </div>
+          <div class="common-item">
+            <span class="common-time">17:30-18:50</span>
+            <span class="common-name">自社製品デモ（COMPASS / SpotPDF / KAKOME）</span>
+          </div>
+          <div class="common-item">
+            <span class="common-time">21:00-22:00</span>
+            <span class="common-name">フィナーレ（プレゼント配布＋質問タイム）</span>
+          </div>
+        </div>
       </div>
 
-      <div class="product">
-        <div class="product-header">
-          <h3>実務で使えるAI×建築セミナー</h3>
-          <div class="price">¥5,000</div>
+      <!-- チケット選択ガイド -->
+      <p class="ticket-guide">↓ 興味のあるセミナーを選んでください</p>
+
+      <!-- チケットカード -->
+      <div class="ticket-grid">
+        <div class="ticket-card best">
+          <div class="ticket-label">BEST</div>
+          <div class="ticket-name">1日通し</div>
+          <div class="ticket-price">¥9,800</div>
+          <div class="ticket-includes">
+            <span class="include-tag all">全セッション</span>
+          </div>
+          <div class="ticket-time">10:00〜22:00</div>
+          <a href="https://buy.stripe.com/aFacN7ezX6SV8zfcSrf7i03" target="_blank" class="ticket-btn">購入する</a>
         </div>
-        <div class="desc">AIを建築実務で活用する実践講座（13:35〜16:00）</div>
-        <a href="https://buy.stripe.com/14A00lezX4KNdTz5pZf7i04" target="_blank">購入する</a>
+
+        <div class="ticket-card">
+          <div class="ticket-name">実務AI×建築</div>
+          <div class="ticket-price">¥5,000</div>
+          <div class="ticket-includes">
+            <span class="include-tag">実務セミナー</span>
+            <span class="include-tag common">+共通</span>
+          </div>
+          <div class="ticket-time">13:35〜16:00</div>
+          <a href="https://buy.stripe.com/14A00lezX4KNdTz5pZf7i04" target="_blank" class="ticket-btn">購入する</a>
+        </div>
+
+        <div class="ticket-card">
+          <div class="ticket-name">画像生成AI</div>
+          <div class="ticket-price">¥4,000</div>
+          <div class="ticket-includes">
+            <span class="include-tag">画像生成セミナー</span>
+            <span class="include-tag common">+共通</span>
+          </div>
+          <div class="ticket-time">16:00〜17:30</div>
+          <a href="https://buy.stripe.com/5kQ9AVcrP1yB5n3aKjf7i05" target="_blank" class="ticket-btn">購入する</a>
+        </div>
+
+        <div class="ticket-card">
+          <div class="ticket-name">GAS＆無料HP</div>
+          <div class="ticket-price">¥3,000</div>
+          <div class="ticket-includes">
+            <span class="include-tag">GASセミナー</span>
+            <span class="include-tag common">+共通</span>
+          </div>
+          <div class="ticket-time">11:45〜12:35 / 19:00〜21:00</div>
+          <a href="https://buy.stripe.com/7sY9AVcrP6SV4iZf0zf7i06" target="_blank" class="ticket-btn">購入する</a>
+        </div>
       </div>
 
-      <div class="product">
-        <div class="product-header">
-          <h3>画像生成AIセミナー</h3>
-          <div class="price">¥4,000</div>
-        </div>
-        <div class="desc">建築パース制作に使える画像生成AI実践講座（16:00〜17:30）</div>
-        <a href="https://buy.stripe.com/5kQ9AVcrP1yB5n3aKjf7i05" target="_blank">購入する</a>
-      </div>
-
-      <div class="product">
-        <div class="product-header">
-          <h3>無料HP＆GAS自動化セミナー</h3>
-          <div class="price">¥3,000</div>
-        </div>
-        <div class="desc">Googleサービスで作るHP＆業務自動化（20:00〜21:00）</div>
-        <a href="https://buy.stripe.com/7sY9AVcrP6SV4iZf0zf7i06" target="_blank">購入する</a>
+      <!-- 注意事項 -->
+      <div class="notice" style="margin-top: 24px;">
+        <strong>購入前にご確認</strong><br>
+        購入時のメールアドレスでZoom登録されます。異なるメールアドレスでは参加できません。
       </div>
 
       <div class="divider"></div>

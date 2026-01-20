@@ -3,3 +3,16 @@ node_modules
 .env
 *.log
 .DS_Store
+stripe-cli.zip
+stripe-cli.tar.gz
+stripe.exe
+*.pdf
+*.csv
+*.txt
+*.sh
+# ルートのpngのみ除外（publicは含める）
+/ChatGPT*.png
+/スクリーンショット*.png
+/73965DF7*.png
+/logo_AI*.png
+stripe-discord/
