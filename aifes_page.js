@@ -917,20 +917,20 @@ const aifesPageHTML = `
 
       <div class="circle-cta">
         <p class="circle-cta-note">いつでも解約OK・違約金なし</p>
-        <a href="https://buy.stripe.com/dRm00l0J75OR3eV8Cbf7i00" target="_blank" class="circle-cta-btn">
-          まずは1ヶ月試してみる
+        <a href="/" class="circle-cta-btn">
+          まずは1ヶ月試してみる（月額¥5,000・学割あり）
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
         </a>
         <p class="circle-cta-sub"><a href="https://suz-u3n-chu.github.io/AI-Architecture-Circle/" target="_blank">サークル詳細を見る</a></p>
       </div>
 
-      <p class="circle-note">入会後、AI FES.無料クーポンがメールで届きます</p>
+      <p class="circle-note">入会後、AI FES.参加URLがメールで届きます</p>
     </div>
 
     <!-- ========== 既存会員向け ========== -->
     <div class="member-box">
       <h4>既にAI×建築サークル会員の方へ</h4>
-      <p>専用クーポンをメールでお送りしています。メールに記載のコードで無料参加できます。</p>
+      <p>入会時にZoom参加URLをお送り済みです。届いていない場合はDiscordでお問い合わせください。</p>
     </div>
 
     <!-- ========== 単発チケット ========== -->

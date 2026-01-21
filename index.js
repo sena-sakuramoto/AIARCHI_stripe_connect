@@ -160,10 +160,39 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
         if (session.custom_fields && session.custom_fields.length > 0) {
           const companyField = session.custom_fields.find(f => f.key === 'company_name');
           if (companyField && companyField.text && companyField.text.value) {
+            const companyName = companyField.text.value;
+
+            // 顧客名を更新
             await stripe.customers.update(session.customer, {
-              name: companyField.text.value
+              name: companyName
             });
-            console.log(`[webhook] updated customer name to: ${companyField.text.value}`);
+            console.log(`[webhook] updated customer name to: ${companyName}`);
+
+            // 最新の請求書も更新（発行済みの請求書の宛名を修正）
+            try {
+              const invoices = await stripe.invoices.list({
+                customer: session.customer,
+                limit: 1
+              });
+              if (invoices.data.length > 0) {
+                const latestInvoice = invoices.data[0];
+                // ドラフト状態の請求書のみ更新可能、確定済みはメタデータで対応
+                if (latestInvoice.status === 'draft') {
+                  await stripe.invoices.update(latestInvoice.id, {
+                    customer_name: companyName
+                  });
+                  console.log(`[webhook] updated invoice ${latestInvoice.id} customer_name`);
+                } else {
+                  // 確定済み請求書はメタデータに保存（カスタム領収書生成用）
+                  await stripe.invoices.update(latestInvoice.id, {
+                    metadata: { company_name: companyName }
+                  });
+                  console.log(`[webhook] saved company_name to invoice metadata: ${latestInvoice.id}`);
+                }
+              }
+            } catch (invoiceErr) {
+              console.error(`[webhook] invoice update error:`, invoiceErr.message);
+            }
           }
         }
         break;
@@ -210,7 +239,7 @@ app.get('/', (_req, res) => {
   const html = `
 <!doctype html><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Discord Pro メンバーシップ</title>
+<title>AI×建築サークル</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
@@ -284,8 +313,8 @@ app.get('/', (_req, res) => {
 </style>
 <div class="mode-badge">${CFG.STRIPE_MODE === 'live' ? 'LIVE' : 'TEST'}</div>
 <div class="container">
-  <h1>Discord Pro</h1>
-  <p class="subtitle">プレミアムメンバーシップ</p>
+  <h1>AI×建築サークル</h1>
+  <p class="subtitle">Proメンバーシップ</p>
 
   <div class="features">
     <div class="feature">Pro限定チャンネルアクセス</div>
@@ -306,6 +335,15 @@ app.get('/', (_req, res) => {
         style="width: 100%; padding: 12px 16px; border-radius: 4px; border: 1px solid #e9ecef; font-size: 1rem;"
       >
     </div>
+    <div style="margin-bottom: 16px;">
+      <label for="company-input" style="display: block; margin-bottom: 8px; font-weight: 500;">会社名 <span style="color: #888; font-weight: normal;">（任意・領収書の宛名になります）</span></label>
+      <input
+        type="text"
+        id="company-input"
+        placeholder="株式会社〇〇"
+        style="width: 100%; padding: 12px 16px; border-radius: 4px; border: 1px solid #e9ecef; font-size: 1rem;"
+      >
+    </div>
     <button type="submit" class="btn primary" id="checkout-btn">
       今すぐ参加
     </button>
@@ -319,6 +357,7 @@ app.get('/', (_req, res) => {
 
       const btn = document.getElementById('checkout-btn');
       const email = document.getElementById('email-input').value;
+      const companyName = document.getElementById('company-input').value;
       const errorDiv = document.getElementById('error-message');
       const warningDiv = document.getElementById('warning-message');
 
@@ -332,7 +371,7 @@ app.get('/', (_req, res) => {
         const response = await fetch('/api/create-checkout-session', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email })
+          body: JSON.stringify({ email, companyName })
         });
 
         const data = await response.json();
@@ -672,7 +711,7 @@ app.get('/portal', async (req, res) => {
         ${currentSub ? `
         <div class="info-card">
           <h3>プラン詳細</h3>
-          <p>プラン: Discord Pro 月額</p>
+          <p>プラン: AI×建築サークル Pro</p>
           <p>金額: ¥${(currentSub.items.data[0]?.price?.unit_amount || 0).toLocaleString()}/月</p>
           <p>ステータス: <span class="status-active">有効</span></p>
         </div>
@@ -718,7 +757,7 @@ app.get('/portal', async (req, res) => {
       <p style="color: #666; font-size: 0.9rem; margin-bottom: 16px;">
         解約や変更をご希望の場合は、直接お問い合わせください。
       </p>
-      <a href="mailto:s.sakuramoto@archi-prisma.co.jp?subject=Discord Pro 解約手続き&body=【Discord Pro 解約希望】%0A%0A■ 登録情報%0A・メールアドレス：${email}%0A・Discord ユーザー名：%0A・Discord ID（数字）：%0A%0A■ 解約希望日%0A・いつから解約したいですか：%0A%0A■ 解約理由（任意）%0A・理由があれば教えてください：%0A%0A■ その他%0A・ご質問やご要望があれば：%0A%0A※このメールに返信いただければ解約手続きを開始いたします。" class="btn">解約手続きのお問い合わせ</a>
+      <a href="mailto:s.sakuramoto@archi-prisma.co.jp?subject=AI×建築サークル 解約手続き&body=【AI×建築サークル 解約希望】%0A%0A■ 登録情報%0A・メールアドレス：${email}%0A・Discord ユーザー名：%0A・Discord ID（数字）：%0A%0A■ 解約希望日%0A・いつから解約したいですか：%0A%0A■ 解約理由（任意）%0A・理由があれば教えてください：%0A%0A■ その他%0A・ご質問やご要望があれば：%0A%0A※このメールに返信いただければ解約手続きを開始いたします。" class="btn">解約手続きのお問い合わせ</a>
       <a href="/" class="btn">ホームに戻る</a>
     </div>
   </div>
@@ -782,7 +821,7 @@ app.get('/portal', async (req, res) => {
 
 // Checkout Session作成API（二重契約・トライアル再利用防止付き）
 app.post('/api/create-checkout-session', async (req, res) => {
-  const { email, priceId, mode } = req.body;
+  const { email, priceId, mode, companyName } = req.body;
 
   if (!email) {
     return res.status(400).json({ error: 'Email is required' });
@@ -808,6 +847,20 @@ app.post('/api/create-checkout-session', async (req, res) => {
 
     let customer = existingCustomers.data[0];
     let warnings = [];
+
+    // 会社名が入力されていたら、顧客名を先に設定（請求書の宛名になる）
+    if (companyName && companyName.trim()) {
+      const customerName = companyName.trim();
+      if (customer) {
+        // 既存顧客の名前を更新
+        customer = await stripe.customers.update(customer.id, { name: customerName });
+        console.log(`[checkout] Updated customer name to: ${customerName}`);
+      } else {
+        // 新規顧客を会社名付きで作成
+        customer = await stripe.customers.create({ email, name: customerName });
+        console.log(`[checkout] Created new customer with name: ${customerName}`);
+      }
+    }
 
     if (customer) {
       console.log(`[checkout] Found existing customer: ${customer.id}`);
@@ -853,30 +906,15 @@ app.post('/api/create-checkout-session', async (req, res) => {
         }
       ],
       billing_address_collection: 'required',
-      custom_fields: [
-        {
-          key: 'company_name',
-          label: {
-            type: 'custom',
-            custom: '会社名（入力すると領収書の宛名になります）'
-          },
-          type: 'text',
-          optional: true
-        }
-      ],
-      success_url: `${base}/success?session_id={CHECKOUT_SESSION_ID}`,
+      allow_promotion_codes: true,
+      success_url: `${base}/oauth/discord/start?code={CHECKOUT_SESSION_ID}`,
       cancel_url: `${base}/?canceled=true`,
       metadata: {
         source: 'api_checkout'
       }
     };
 
-    // トライアル設定: デフォルトではトライアルなし（クーポンで対応）
-    if (checkoutMode === 'subscription') {
-      sessionParams.subscription_data = {
-        trial_period_days: 0
-      };
-    }
+    // トライアル設定なし（クーポンで対応）
 
     const session = await stripe.checkout.sessions.create(sessionParams);
 
@@ -906,7 +944,7 @@ app.get('/success', async (req, res) => {
   const html = `
 <!doctype html><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>決済完了 | Discord Pro</title>
+<title>決済完了 | AI×建築サークル</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
@@ -1002,7 +1040,7 @@ app.get('/success', async (req, res) => {
 </style>
 <div class="container">
   <h1>決済完了</h1>
-  <p class="subtitle">Discord Pro メンバーシップが有効になりました</p>
+  <p class="subtitle">AI×建築サークルが有効になりました</p>
 
   <div class="steps">
     <h2>次の手順</h2>
@@ -1027,7 +1065,7 @@ app.get('/success', async (req, res) => {
 
   <div class="manage-section">
     <h3 style="margin-bottom: 16px; color: #666;">サブスクリプション管理</h3>
-    <a class="btn" href="mailto:s.sakuramoto@archi-prisma.co.jp?subject=Discord Pro 解約手続き&body=【Discord Pro 解約希望】%0A%0A■ 登録情報%0A・メールアドレス：%0A・Discord ユーザー名：%0A・Discord ID（数字）：%0A%0A■ 解約希望日%0A・いつから解約したいですか：%0A%0A■ 解約理由（任意）%0A・理由があれば教えてください：%0A%0A■ その他%0A・ご質問やご要望があれば：%0A%0A※このメールに返信いただければ解約手続きを開始いたします。">解約手続きのお問い合わせ</a>
+    <a class="btn" href="mailto:s.sakuramoto@archi-prisma.co.jp?subject=AI×建築サークル 解約手続き&body=【AI×建築サークル 解約希望】%0A%0A■ 登録情報%0A・メールアドレス：%0A・Discord ユーザー名：%0A・Discord ID（数字）：%0A%0A■ 解約希望日%0A・いつから解約したいですか：%0A%0A■ 解約理由（任意）%0A・理由があれば教えてください：%0A%0A■ その他%0A・ご質問やご要望があれば：%0A%0A※このメールに返信いただければ解約手続きを開始いたします。">解約手続きのお問い合わせ</a>
   </div>
 
   <div class="note">
@@ -1058,6 +1096,162 @@ app.get('/portal', async (req, res) => {
   } catch (e) {
     console.error('[portal] error:', e);
     res.status(500).send('failed to create portal session');
+  }
+});
+
+// メールアドレスでDiscord連携を開始（メールからのリンク用）
+app.get('/link', async (req, res) => {
+  const email = req.query.email;
+  const base = getBaseUrl(req);
+
+  if (!email) {
+    // メールアドレスがない場合は入力フォームを表示
+    const html = `
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Discord連携 | AI×建築サークル</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: system-ui, -apple-system, "Noto Sans JP", sans-serif;
+  background: #f8f9fa;
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+.container {
+  max-width: 400px;
+  width: 100%;
+  background: white;
+  padding: 40px;
+  border-radius: 12px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+}
+h1 { font-size: 1.5rem; margin-bottom: 8px; color: #1a1a1a; }
+.subtitle { color: #666; margin-bottom: 24px; }
+.form-group { margin-bottom: 20px; }
+label { display: block; margin-bottom: 8px; font-weight: 500; color: #333; }
+input {
+  width: 100%;
+  padding: 12px;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  font-size: 1rem;
+}
+input:focus { outline: none; border-color: #5865F2; }
+.btn {
+  width: 100%;
+  padding: 14px;
+  background: #5865F2;
+  color: white;
+  border: none;
+  border-radius: 8px;
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.btn:hover { background: #4752C4; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Discord連携</h1>
+  <p class="subtitle">購入時のメールアドレスを入力してください</p>
+  <form method="GET" action="/link">
+    <div class="form-group">
+      <label for="email">メールアドレス</label>
+      <input type="email" id="email" name="email" placeholder="your@example.com" required>
+    </div>
+    <button type="submit" class="btn">Discord連携を開始</button>
+  </form>
+</div>
+</body>
+</html>
+    `;
+    return res.type('html').send(html);
+  }
+
+  try {
+    // メールアドレスで顧客を検索
+    const customers = await stripe.customers.list({ email, limit: 1 });
+    if (customers.data.length === 0) {
+      return res.status(404).send(`
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>顧客が見つかりません</title>
+<style>
+body { font-family: system-ui, sans-serif; max-width: 400px; margin: 60px auto; padding: 20px; text-align: center; }
+h1 { color: #e53e3e; margin-bottom: 16px; }
+a { color: #5865F2; }
+</style>
+</head>
+<body>
+<h1>顧客が見つかりません</h1>
+<p>このメールアドレスでの購入履歴が見つかりませんでした。</p>
+<p><a href="/link">別のメールアドレスで試す</a></p>
+</body>
+</html>
+      `);
+    }
+
+    const customerId = customers.data[0].id;
+
+    // アクティブなサブスクリプションがあるか確認
+    const subscriptions = await stripe.subscriptions.list({
+      customer: customerId,
+      status: 'active',
+      limit: 1
+    });
+
+    if (subscriptions.data.length === 0) {
+      return res.status(400).send(`
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>有効なサブスクリプションがありません</title>
+<style>
+body { font-family: system-ui, sans-serif; max-width: 400px; margin: 60px auto; padding: 20px; text-align: center; }
+h1 { color: #e53e3e; margin-bottom: 16px; }
+a { color: #5865F2; }
+</style>
+</head>
+<body>
+<h1>有効なサブスクリプションがありません</h1>
+<p>このメールアドレスには有効なサブスクリプションがありません。</p>
+<p><a href="/">サブスクリプションを購入する</a></p>
+</body>
+</html>
+      `);
+    }
+
+    // 顧客の最新のcheckout sessionを検索
+    const sessions = await stripe.checkout.sessions.list({
+      customer: customerId,
+      limit: 1
+    });
+
+    if (sessions.data.length === 0) {
+      return res.status(500).send('Checkout session not found');
+    }
+
+    const sessionId = sessions.data[0].id;
+
+    // Discord OAuthにリダイレクト
+    res.redirect(`${base}/oauth/discord/start?code=${encodeURIComponent(sessionId)}`);
+
+  } catch (error) {
+    console.error('[link] error:', error);
+    res.status(500).send('エラーが発生しました');
   }
 });
 
@@ -1199,17 +1393,142 @@ app.get('/oauth/discord/callback', async (req, res) => {
     await ensureRole(discordUserId, entitled, `oauth_link entitle=${entitled}`);
 
     const html = `
-<!doctype html><meta charset="utf-8">
-<title>Discord連携完了</title>
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>セットアップ完了 | AI×建築サークル</title>
 <style>
-body{font-family:system-ui,-apple-system,"Noto Sans JP",sans-serif;max-width:720px;margin:48px auto;line-height:1.8}
-a.btn{display:inline-block;padding:12px 18px;border:1px solid #333;text-decoration:none;margin-right:12px}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: system-ui, -apple-system, "Noto Sans JP", sans-serif;
+  background: linear-gradient(135deg, #1a1a1a 0%, #333 100%);
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+.card {
+  background: white;
+  border-radius: 16px;
+  padding: 48px 40px;
+  max-width: 480px;
+  width: 100%;
+  text-align: center;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+}
+.success-icon {
+  width: 80px;
+  height: 80px;
+  background: linear-gradient(135deg, #4ade80, #22c55e);
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0 auto 24px;
+  animation: scaleIn 0.5s ease-out;
+}
+@keyframes scaleIn {
+  0% { transform: scale(0); }
+  50% { transform: scale(1.2); }
+  100% { transform: scale(1); }
+}
+.success-icon svg { width: 40px; height: 40px; color: white; }
+h1 { font-size: 1.8rem; color: #1a1a1a; margin-bottom: 12px; }
+.subtitle { color: #666; margin-bottom: 32px; line-height: 1.6; }
+.role-badge {
+  display: inline-block;
+  background: linear-gradient(135deg, #667eea, #764ba2);
+  color: white;
+  padding: 8px 20px;
+  border-radius: 20px;
+  font-weight: 600;
+  margin-bottom: 32px;
+}
+.next-step {
+  background: #f8f9fa;
+  border-radius: 12px;
+  padding: 24px;
+  margin-bottom: 24px;
+  text-align: left;
+}
+.next-step h2 {
+  font-size: 0.9rem;
+  color: #666;
+  margin-bottom: 12px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+.next-step p { color: #333; line-height: 1.6; }
+.btn {
+  display: inline-block;
+  padding: 16px 32px;
+  border-radius: 8px;
+  text-decoration: none;
+  font-weight: 600;
+  font-size: 1rem;
+  transition: transform 0.2s, box-shadow 0.2s;
+}
+.btn:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
+.btn-primary {
+  background: #5865F2;
+  color: white;
+  width: 100%;
+  margin-bottom: 12px;
+}
+.btn-secondary {
+  background: white;
+  color: #333;
+  border: 1px solid #ddd;
+  width: 100%;
+}
+.note {
+  margin-top: 24px;
+  font-size: 0.85rem;
+  color: #888;
+  line-height: 1.6;
+}
+.brand {
+  font-size: 0.9rem;
+  color: #666;
+  letter-spacing: 2px;
+  margin-bottom: 24px;
+  font-weight: 500;
+}
 </style>
-<h1>Discord連携が完了しました</h1>
-<p>サーバ内で <b>@pro</b> ロールを${entitled ? '付与' : '剥奪'}しました。</p>
-<p><a class="btn" href="${CFG.DISCORD_GUILD_INVITE_URL}" target="_blank" rel="noopener">サーバを開く</a>
-<a class="btn" href="${base}/success?code=${encodeURIComponent(sessionId)}">戻る</a></p>
-<p>もしロールが反映されない場合：1分待ってリロード、または管理者が再同期を実行してください。</p>
+</head>
+<body>
+<div class="card">
+  <p class="brand">AI×建築サークル</p>
+  <div class="success-icon">
+    <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7"></path>
+    </svg>
+  </div>
+  <h1>セットアップ完了!</h1>
+  <p class="subtitle">Discord連携が正常に完了しました</p>
+  <div class="role-badge">@pro ロール付与済み</div>
+
+  <div class="next-step">
+    <h2>次のステップ</h2>
+    <p>Discordサーバーに参加して、Pro限定チャンネルにアクセスしましょう。</p>
+  </div>
+
+  <a class="btn btn-primary" href="${CFG.DISCORD_GUILD_INVITE_URL}" target="_blank" rel="noopener">
+    Discordサーバーを開く
+  </a>
+  <a class="btn btn-secondary" href="${base}/portal?code=${encodeURIComponent(sessionId)}">
+    サブスクリプション管理
+  </a>
+
+  <p class="note">
+    ロールが反映されない場合は、1分ほど待ってからサーバーを確認してください。
+  </p>
+</div>
+</body>
+</html>
 `;
     res.type('html').send(html);
   } catch (e) {
@@ -1244,6 +1563,63 @@ app.post('/admin/resync', async (req, res) => {
   } catch (e) {
     console.error('[resync] error:', e);
     res.status(500).send('resync failed');
+  }
+});
+
+// 管理用：未連携者リストを取得（GASからリマインドメール送信用）
+app.get('/admin/unlinked-customers', async (req, res) => {
+  const token = req.query.token;
+  if (token !== CFG.SCHEDULER_TOKEN) return res.status(401).send('unauthorized');
+
+  try {
+    // 1. アクティブなサブスクリプションを持つ全顧客を取得
+    const subscriptions = await stripe.subscriptions.list({
+      status: 'active',
+      limit: 100,
+      expand: ['data.customer']
+    });
+
+    // 2. Firestoreから連携済みユーザーのcustomerIdを取得
+    const linkedSnapshot = await firestore.collection('users').get();
+    const linkedCustomerIds = new Set();
+    linkedSnapshot.forEach(doc => {
+      const data = doc.data();
+      if (data.customerId) {
+        linkedCustomerIds.add(data.customerId);
+      }
+    });
+
+    // 3. 未連携の顧客を抽出
+    const unlinkedCustomers = [];
+    for (const sub of subscriptions.data) {
+      const customer = sub.customer;
+      if (typeof customer === 'object' && customer.id && !linkedCustomerIds.has(customer.id)) {
+        // サブスク開始から24時間以上経過しているかチェック
+        const subCreatedAt = sub.created * 1000; // Unix timestamp to ms
+        const hoursSinceCreation = (Date.now() - subCreatedAt) / (1000 * 60 * 60);
+
+        if (hoursSinceCreation >= 24) {
+          unlinkedCustomers.push({
+            customerId: customer.id,
+            email: customer.email,
+            name: customer.name || '',
+            subscriptionCreated: new Date(subCreatedAt).toISOString(),
+            hoursSinceCreation: Math.floor(hoursSinceCreation)
+          });
+        }
+      }
+    }
+
+    console.log(`[unlinked] Found ${unlinkedCustomers.length} unlinked customers (24h+)`);
+
+    res.json({
+      count: unlinkedCustomers.length,
+      customers: unlinkedCustomers
+    });
+
+  } catch (error) {
+    console.error('[unlinked] error:', error);
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -1932,14 +2308,14 @@ app.get('/aifes-old', (req, res) => {
         <!-- ボタン -->
         <div style="display: flex; gap: 12px; justify-content: center; flex-wrap: wrap;">
           <a href="https://suz-u3n-chu.github.io/AI-Architecture-Circle/" target="_blank" style="background: transparent; border: 1px solid rgba(255,255,255,0.4); padding: 12px 20px; font-size: 13px;">詳細を見る</a>
-          <a href="https://buy.stripe.com/dRm00l0J75OR3eV8Cbf7i00" target="_blank" style="padding: 12px 20px; font-size: 13px;">入会する（月額¥5,000）</a>
+          <a href="/" style="padding: 12px 20px; font-size: 13px;">入会する（月額¥5,000・学割あり）</a>
         </div>
-        <p style="font-size: 11px; margin-top: 12px; opacity: 0.6;">入会後、AI FES.無料クーポンがメールで届きます</p>
+        <p style="font-size: 11px; margin-top: 12px; opacity: 0.6;">入会後、AI FES.参加URLがメールで届きます</p>
       </div>
 
       <div class="member-notice">
         <h3>既にサークル会員の方へ</h3>
-        <p>会員様には専用クーポンをメールでお送りしています。<br>メールに記載のコードで無料参加できます。</p>
+        <p>入会時にZoom参加URLをお送り済みです。<br>メールをご確認ください。届いていない場合はDiscordでお問い合わせください。</p>
       </div>
 
       <div class="divider"></div>
