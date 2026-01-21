@@ -918,7 +918,7 @@ const aifesPageHTML = `
       <div class="circle-cta">
         <p class="circle-cta-note">いつでも解約OK・違約金なし</p>
         <a href="/" class="circle-cta-btn">
-          まずは1ヶ月試してみる（月額¥5,000・学割あり）
+          まずは1ヶ月試してみる
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
         </a>
         <p class="circle-cta-sub"><a href="https://suz-u3n-chu.github.io/AI-Architecture-Circle/" target="_blank">サークル詳細を見る</a></p>
