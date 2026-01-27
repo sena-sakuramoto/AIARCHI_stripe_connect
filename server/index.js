@@ -74,6 +74,50 @@ const MEETING_NAME_MAP = {
   'F': 'AI FES. プレゼント配布＋最終質問タイム＋AI×建築サークル案内'
 };
 
+// ============================================
+// アーカイブ動画ページ用設定
+// ============================================
+
+const AIFES_SESSIONS = {
+  A: { name: '直近30日：最新AI Newsまとめ', youtubeId: 'zspijMjW-tU', duration: '75min' },
+  B: { name: '自社プロダクト紹介（COMPASS/SpotPDF/KAKOME）', youtubeId: 'J33xRxt2kiU', duration: '80min' },
+  C: { name: '実務で使えるAI×建築セミナー', youtubeId: '4ItAbxrfL84', duration: '145min' },
+  D: { name: '今使える画像生成AIセミナー', youtubeId: 'ZyKBkx0IrT8', duration: '90min' },
+  E: { name: 'Googleサービスでつくる無料HP＆業務自動化', youtubeId: 'fiF6r7ZOUCI', duration: '120min' },
+  F: { name: 'プレゼント配布＋最終質問タイム', youtubeId: 'QZ3voPMY7QU', duration: '60min' }
+};
+
+// Price ID -> アーカイブセッションキー（E1/E2分離版）
+const ARCHIVE_SESSION_MAP = {
+  [PRICE_ID_FULL_DAY]: ['A', 'B', 'C', 'D', 'E', 'F'],
+  [PRICE_ID_PRACTICAL_AI_ARCHITECTURE]: ['C', 'F'],
+  [PRICE_ID_IMAGE_GEN_AI]: ['D', 'F'],
+  [PRICE_ID_GOOGLE_HP_GAS]: ['E', 'F']
+};
+
+// アーカイブ認証レートリミッター（メールごとに10分間で最大5回）
+const archiveRateLimit = new Map();
+function checkArchiveRateLimit(email) {
+  const now = Date.now();
+  const windowMs = 10 * 60 * 1000; // 10分
+  const maxRequests = 5;
+  const key = email.toLowerCase().trim();
+
+  if (!archiveRateLimit.has(key)) {
+    archiveRateLimit.set(key, []);
+  }
+
+  const timestamps = archiveRateLimit.get(key).filter(t => now - t < windowMs);
+  if (timestamps.length >= maxRequests) {
+    archiveRateLimit.set(key, timestamps);
+    return false;
+  }
+
+  timestamps.push(now);
+  archiveRateLimit.set(key, timestamps);
+  return true;
+}
+
 /**
  * 処理済みイベントを読み込む
  */
@@ -728,7 +772,589 @@ app.get('/aifes', (req, res) => {
   res.type('html').send(html);
 });
 
-// サーバー起動
+// ============================================
+// アーカイブ動画ページ
+// ============================================
+
+// フォームデータのパース（webhook rawボディの後に配置）
+app.use(express.urlencoded({ extended: true }));
+
+// GET /archive - メール入力フォーム
+app.get('/archive', (req, res) => {
+  const html = `
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="robots" content="noindex, nofollow">
+  <title>AI FES. アーカイブ動画</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Hiragino Sans', 'Hiragino Kaku Gothic ProN', Meiryo, sans-serif;
+      background: linear-gradient(135deg, #0a0a0a 0%, #1a1a2e 50%, #0a0a0a 100%);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 40px 20px;
+      color: #e0e0e0;
+    }
+    .container {
+      max-width: 480px;
+      width: 100%;
+    }
+    .card {
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 16px;
+      padding: 48px 40px;
+      backdrop-filter: blur(20px);
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+    }
+    .logo {
+      text-align: center;
+      margin-bottom: 40px;
+    }
+    .logo h1 {
+      font-size: 32px;
+      font-weight: 700;
+      letter-spacing: 6px;
+      color: #ffffff;
+      margin-bottom: 4px;
+    }
+    .logo .dot {
+      color: #6c63ff;
+    }
+    .logo .subtitle {
+      font-size: 13px;
+      color: #888;
+      letter-spacing: 3px;
+      margin-top: 8px;
+    }
+    .description {
+      text-align: center;
+      font-size: 14px;
+      color: #999;
+      line-height: 1.8;
+      margin-bottom: 36px;
+    }
+    .form-group {
+      margin-bottom: 24px;
+    }
+    .form-group label {
+      display: block;
+      font-size: 12px;
+      font-weight: 600;
+      color: #aaa;
+      letter-spacing: 2px;
+      margin-bottom: 8px;
+      text-transform: uppercase;
+    }
+    .form-group input {
+      width: 100%;
+      padding: 14px 16px;
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 8px;
+      color: #fff;
+      font-size: 16px;
+      outline: none;
+      transition: border-color 0.3s, box-shadow 0.3s;
+    }
+    .form-group input::placeholder {
+      color: #555;
+    }
+    .form-group input:focus {
+      border-color: #6c63ff;
+      box-shadow: 0 0 0 3px rgba(108, 99, 255, 0.15);
+    }
+    .submit-btn {
+      width: 100%;
+      padding: 16px;
+      background: linear-gradient(135deg, #6c63ff, #4834d4);
+      color: white;
+      border: none;
+      border-radius: 8px;
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: 1px;
+      cursor: pointer;
+      transition: transform 0.2s, box-shadow 0.2s;
+    }
+    .submit-btn:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 4px 20px rgba(108, 99, 255, 0.4);
+    }
+    .submit-btn:active {
+      transform: translateY(0);
+    }
+    .footer {
+      text-align: center;
+      margin-top: 32px;
+      font-size: 12px;
+      color: #555;
+    }
+    .footer a {
+      color: #6c63ff;
+      text-decoration: none;
+    }
+    @media (max-width: 520px) {
+      .card {
+        padding: 36px 24px;
+      }
+      .logo h1 {
+        font-size: 26px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="card">
+      <div class="logo">
+        <h1>AI FES<span class="dot">.</span></h1>
+        <p class="subtitle">アーカイブ動画</p>
+      </div>
+      <p class="description">
+        チケットをご購入いただいた方は<br>
+        購入時のメールアドレスを入力してください。<br>
+        アーカイブ動画をご視聴いただけます。
+      </p>
+      <form action="/archive/verify" method="POST">
+        <div class="form-group">
+          <label>メールアドレス</label>
+          <input type="email" name="email" placeholder="example@email.com" required autocomplete="email">
+        </div>
+        <button type="submit" class="submit-btn">動画を視聴する</button>
+      </form>
+    </div>
+    <div class="footer">
+      <p>&copy; AI Architecture Circle</p>
+    </div>
+  </div>
+</body>
+</html>`;
+  res.type('html').send(html);
+});
+
+// POST /archive/verify - メール認証 → 動画ページ
+app.post('/archive/verify', async (req, res) => {
+  const email = (req.body.email || '').trim().toLowerCase();
+
+  // バリデーション
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.type('html').send(generateArchiveErrorPage('有効なメールアドレスを入力してください。'));
+  }
+
+  // レートリミットチェック
+  if (!checkArchiveRateLimit(email)) {
+    return res.status(429).type('html').send(
+      generateArchiveErrorPage('リクエスト回数の上限に達しました。しばらく時間をおいてから再度お試しください。')
+    );
+  }
+
+  try {
+    // Stripe Search APIで購入済みセッションを検索
+    const searchResults = await stripe.checkout.sessions.search({
+      query: `customer_details.email:"${email}" AND payment_status:"paid"`,
+      limit: 100
+    });
+
+    if (!searchResults.data || searchResults.data.length === 0) {
+      return res.type('html').send(
+        generateArchiveErrorPage('ご入力のメールアドレスでの購入履歴が見つかりませんでした。<br>購入時に使用したメールアドレスをご確認ください。')
+      );
+    }
+
+    // 各セッションのline_itemsからprice_idを収集
+    const purchasedSessionKeys = new Set();
+
+    for (const session of searchResults.data) {
+      try {
+        const lineItems = await stripe.checkout.sessions.listLineItems(session.id, { limit: 100 });
+        for (const item of lineItems.data) {
+          const priceId = item.price?.id;
+          if (priceId && ARCHIVE_SESSION_MAP[priceId]) {
+            ARCHIVE_SESSION_MAP[priceId].forEach(key => purchasedSessionKeys.add(key));
+          }
+        }
+      } catch (lineItemErr) {
+        console.error(`[Archive] line_items取得エラー (session: ${session.id}):`, lineItemErr.message);
+      }
+    }
+
+    if (purchasedSessionKeys.size === 0) {
+      return res.type('html').send(
+        generateArchiveErrorPage('AI FES.のチケット購入履歴が見つかりませんでした。<br>別のメールアドレスで購入された可能性があります。')
+      );
+    }
+
+    // セッションキーをソートして動画ページを生成
+    const sortedKeys = ['A', 'B', 'C', 'D', 'E', 'F'].filter(k => purchasedSessionKeys.has(k));
+
+    return res.type('html').send(generateArchiveVideoPage(sortedKeys));
+
+  } catch (err) {
+    console.error('[Archive] Stripe検索エラー:', err.message);
+    return res.status(500).type('html').send(
+      generateArchiveErrorPage('サーバーエラーが発生しました。しばらく時間をおいてから再度お試しください。')
+    );
+  }
+});
+
+/**
+ * アーカイブ動画ページ HTML生成
+ */
+function generateArchiveVideoPage(sessionKeys) {
+  const sessionCards = sessionKeys.map(key => {
+    const session = AIFES_SESSIONS[key];
+    if (!session) return '';
+
+    const videoContent = session.youtubeId
+      ? `<div class="video-wrapper">
+           <iframe src="https://www.youtube.com/embed/${session.youtubeId}" 
+                   title="${session.name}"
+                   frameborder="0" 
+                   allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" 
+                   allowfullscreen></iframe>
+         </div>`
+      : `<div class="video-placeholder">
+           <div class="placeholder-icon">▶</div>
+           <p>準備中</p>
+           <span>動画は近日公開予定です</span>
+         </div>`;
+
+    return `
+    <div class="session-card">
+      <div class="session-header">
+        <span class="session-badge">${key}</span>
+        <div class="session-info">
+          <h3>${session.name}</h3>
+          <span class="session-duration">${session.duration}</span>
+        </div>
+      </div>
+      ${videoContent}
+    </div>`;
+  }).join('');
+
+  return `
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="robots" content="noindex, nofollow">
+  <title>AI FES. アーカイブ動画</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Hiragino Sans', 'Hiragino Kaku Gothic ProN', Meiryo, sans-serif;
+      background: linear-gradient(180deg, #0a0a0a 0%, #1a1a2e 30%, #16213e 60%, #0a0a0a 100%);
+      min-height: 100vh;
+      padding: 40px 20px 60px;
+      color: #e0e0e0;
+    }
+
+    /* Header */
+    .page-header {
+      text-align: center;
+      margin-bottom: 48px;
+      padding-top: 20px;
+    }
+    .page-header h1 {
+      font-size: 36px;
+      font-weight: 700;
+      letter-spacing: 6px;
+      color: #ffffff;
+      margin-bottom: 4px;
+    }
+    .page-header h1 .dot { color: #6c63ff; }
+    .page-header .subtitle {
+      font-size: 14px;
+      color: #888;
+      letter-spacing: 3px;
+      margin-top: 8px;
+    }
+    .page-header .session-count {
+      display: inline-block;
+      margin-top: 16px;
+      padding: 6px 20px;
+      background: rgba(108, 99, 255, 0.15);
+      border: 1px solid rgba(108, 99, 255, 0.3);
+      border-radius: 20px;
+      font-size: 13px;
+      color: #a29bfe;
+      letter-spacing: 1px;
+    }
+
+    .notice-bar {
+      max-width: 800px;
+      margin: 0 auto 40px;
+      padding: 12px 20px;
+      background: rgba(255, 193, 7, 0.08);
+      border: 1px solid rgba(255, 193, 7, 0.2);
+      border-radius: 8px;
+      text-align: center;
+      font-size: 13px;
+      color: #ffd43b;
+    }
+
+    /* Session Cards */
+    .sessions-grid {
+      max-width: 800px;
+      margin: 0 auto;
+      display: flex;
+      flex-direction: column;
+      gap: 28px;
+    }
+    .session-card {
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid rgba(255, 255, 255, 0.07);
+      border-radius: 16px;
+      overflow: hidden;
+      transition: border-color 0.3s, box-shadow 0.3s;
+    }
+    .session-card:hover {
+      border-color: rgba(108, 99, 255, 0.3);
+      box-shadow: 0 4px 24px rgba(108, 99, 255, 0.1);
+    }
+    .session-header {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      padding: 20px 24px;
+    }
+    .session-badge {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 44px;
+      height: 44px;
+      padding: 0 12px;
+      background: linear-gradient(135deg, #6c63ff, #4834d4);
+      border-radius: 10px;
+      font-size: 15px;
+      font-weight: 700;
+      color: white;
+      letter-spacing: 1px;
+    }
+    .session-info {
+      flex: 1;
+    }
+    .session-info h3 {
+      font-size: 16px;
+      font-weight: 600;
+      color: #fff;
+      margin-bottom: 4px;
+    }
+    .session-duration {
+      font-size: 12px;
+      color: #888;
+      letter-spacing: 1px;
+    }
+
+    /* Video Embed */
+    .video-wrapper {
+      position: relative;
+      width: 100%;
+      padding-top: 56.25%;
+      background: #000;
+    }
+    .video-wrapper iframe {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+    }
+
+    /* Placeholder */
+    .video-placeholder {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 48px 20px;
+      background: rgba(0, 0, 0, 0.3);
+      text-align: center;
+    }
+    .placeholder-icon {
+      width: 64px;
+      height: 64px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 50%;
+      font-size: 24px;
+      color: #555;
+      margin-bottom: 16px;
+    }
+    .video-placeholder p {
+      font-size: 16px;
+      font-weight: 600;
+      color: #666;
+      margin-bottom: 4px;
+    }
+    .video-placeholder span {
+      font-size: 13px;
+      color: #444;
+    }
+
+    /* Footer */
+    .page-footer {
+      max-width: 800px;
+      margin: 60px auto 0;
+      padding-top: 32px;
+      border-top: 1px solid rgba(255, 255, 255, 0.06);
+      text-align: center;
+    }
+    .page-footer p {
+      font-size: 12px;
+      color: #555;
+      line-height: 2;
+    }
+    .page-footer a {
+      color: #6c63ff;
+      text-decoration: none;
+    }
+
+    @media (max-width: 600px) {
+      body { padding: 24px 12px 40px; }
+      .page-header h1 { font-size: 28px; }
+      .session-header { padding: 16px; gap: 12px; }
+      .session-badge { min-width: 38px; height: 38px; font-size: 13px; }
+      .session-info h3 { font-size: 14px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page-header">
+    <h1>AI FES<span class="dot">.</span></h1>
+    <p class="subtitle">アーカイブ動画</p>
+    <div class="session-count">${sessionKeys.length} セッション視聴可能</div>
+  </div>
+
+  <div class="notice-bar">
+    ⚠ このページのURLの共有はご遠慮ください
+  </div>
+
+  <div class="sessions-grid">
+    ${sessionCards}
+  </div>
+
+  <div class="page-footer">
+    <p>
+      &copy; AI Architecture Circle<br>
+      お問い合わせ: <a href="${SUPPORT_FORM_URL || '#'}">お問い合わせフォーム</a>
+    </p>
+  </div>
+</body>
+</html>`;
+}
+
+/**
+ * アーカイブエラーページ HTML生成
+ */
+function generateArchiveErrorPage(message) {
+  return `
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="robots" content="noindex, nofollow">
+  <title>AI FES. アーカイブ動画</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Hiragino Sans', 'Hiragino Kaku Gothic ProN', Meiryo, sans-serif;
+      background: linear-gradient(135deg, #0a0a0a 0%, #1a1a2e 50%, #0a0a0a 100%);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 40px 20px;
+      color: #e0e0e0;
+    }
+    .container {
+      max-width: 480px;
+      width: 100%;
+    }
+    .card {
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 16px;
+      padding: 48px 40px;
+      backdrop-filter: blur(20px);
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+      text-align: center;
+    }
+    .error-icon {
+      width: 64px;
+      height: 64px;
+      margin: 0 auto 24px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(255, 107, 107, 0.1);
+      border: 1px solid rgba(255, 107, 107, 0.2);
+      border-radius: 50%;
+      font-size: 28px;
+    }
+    .card h2 {
+      font-size: 18px;
+      font-weight: 600;
+      color: #fff;
+      margin-bottom: 16px;
+    }
+    .card p {
+      font-size: 14px;
+      color: #999;
+      line-height: 1.8;
+      margin-bottom: 32px;
+    }
+    .back-btn {
+      display: inline-block;
+      padding: 14px 32px;
+      background: linear-gradient(135deg, #6c63ff, #4834d4);
+      color: white;
+      text-decoration: none;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      transition: transform 0.2s, box-shadow 0.2s;
+    }
+    .back-btn:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 4px 20px rgba(108, 99, 255, 0.4);
+    }
+    @media (max-width: 520px) {
+      .card { padding: 36px 24px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="card">
+      <div class="error-icon">✕</div>
+      <h2>購入履歴が見つかりません</h2>
+      <p>${message}</p>
+      <a href="/archive" class="back-btn">もう一度入力する</a>
+    </div>
+  </div>
+</body>
+</html>`;
+}
+
+// Vercel用エクスポート
+module.exports = app;
+
+// サーバー起動（ローカル開発用）
+if (!process.env.VERCEL) {
 app.listen(PORT, () => {
   console.log('========================================');
   console.log('Stripe Webhookサーバー');
@@ -759,3 +1385,4 @@ app.listen(PORT, () => {
 
   console.log('========================================');
 });
+} // end if (!process.env.VERCEL)

@@ -24,6 +24,7 @@ Thumbs.db
 *.json
 !package.json
 !package-lock.json
+!vercel.json
 
 # Build
 dist/
@@ -33,3 +34,13 @@ build/
 stripe.exe
 stripe-cli.tar.gz
 stripe-cli.zip
+
+# Sensitive data
+*.csv
+*.pdf
+discord_link*.txt
+*_discord_link.txt
+*.png
+!public/**/*.png
+!slides/logo.png
+data/
