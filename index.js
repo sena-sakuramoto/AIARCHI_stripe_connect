@@ -3365,77 +3365,473 @@ app.get('/referral', (_req, res) => {
 <title>紹介プログラム - AI×建築サークル</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: system-ui, -apple-system, "Noto Sans JP", sans-serif; background: #f8f9fa; min-height: 100vh; display: flex; align-items: center; justify-content: center; color: #333; }
-  .container { max-width: 500px; width: 100%; text-align: center; padding: 48px 24px; background: white; border-radius: 8px; border: 1px solid #e9ecef; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
-  h1 { font-size: 1.8rem; margin-bottom: 8px; }
-  .subtitle { color: #666; margin-bottom: 32px; font-size: 0.95rem; }
-  .reward-box { background: #e8f5e9; border: 1px solid #66bb6a; border-radius: 8px; padding: 16px; margin-bottom: 24px; }
-  .reward-box strong { color: #2e7d32; }
-  input { width: 100%; padding: 12px 16px; border-radius: 4px; border: 1px solid #e9ecef; font-size: 1rem; margin-bottom: 12px; }
-  .btn { display: inline-block; padding: 14px 28px; background: #333; color: #fff; border: none; border-radius: 4px; font-size: 1rem; font-weight: 500; cursor: pointer; width: 100%; }
-  .btn:hover { background: #000; }
-  .btn:disabled { opacity: 0.5; }
-  .result { display: none; margin-top: 24px; text-align: left; }
-  .link-box { background: #f5f5f5; border: 1px solid #ddd; border-radius: 6px; padding: 12px; margin: 12px 0; word-break: break-all; font-family: monospace; font-size: 0.85rem; }
-  .copy-btn { padding: 8px 16px; background: #1976d2; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 0.85rem; margin-top: 8px; }
-  .copy-btn:hover { background: #1565c0; }
-  .stats { display: flex; gap: 16px; margin-top: 16px; }
-  .stat { flex: 1; background: #f8f9fa; border-radius: 6px; padding: 12px; text-align: center; }
-  .stat-num { font-size: 1.5rem; font-weight: bold; color: #333; }
-  .stat-label { font-size: 0.75rem; color: #888; }
-  .error { color: #dc3545; margin-top: 8px; display: none; }
-  a.back { display: inline-block; margin-top: 24px; color: #666; text-decoration: none; font-size: 0.9rem; }
+  body {
+    font-family: system-ui, -apple-system, "Noto Sans JP", sans-serif;
+    background: #f8f9fa;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #333;
+    padding: 24px;
+  }
+  .page-wrapper {
+    max-width: 560px;
+    width: 100%;
+  }
+
+  /* ---------- Header ---------- */
+  .header {
+    text-align: center;
+    margin-bottom: 24px;
+  }
+  .header-badge {
+    display: inline-block;
+    background: #ff3300;
+    color: #fff;
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    padding: 4px 14px;
+    border-radius: 100px;
+    margin-bottom: 14px;
+    text-transform: uppercase;
+  }
+  .header h1 {
+    font-size: 1.9rem;
+    font-weight: 800;
+    margin-bottom: 6px;
+    line-height: 1.3;
+  }
+  .header .subtitle {
+    color: #666;
+    font-size: 0.95rem;
+  }
+
+  /* ---------- Card ---------- */
+  .card {
+    background: #fff;
+    border-radius: 12px;
+    border: 1px solid #e9ecef;
+    box-shadow: 0 8px 30px rgba(0,0,0,0.08);
+    padding: 36px 28px;
+    margin-bottom: 16px;
+  }
+  .card + .card { margin-top: 0; }
+
+  /* ---------- Benefits ---------- */
+  .benefits-title {
+    font-size: 0.8rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #999;
+    margin-bottom: 16px;
+  }
+  .benefit-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 14px;
+    padding: 16px 0;
+  }
+  .benefit-row + .benefit-row {
+    border-top: 1px solid #f0f0f0;
+  }
+  .benefit-icon {
+    flex-shrink: 0;
+    width: 44px;
+    height: 44px;
+    border-radius: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.3rem;
+  }
+  .benefit-icon.you {
+    background: #ff33000f;
+    border: 1.5px solid #ff330030;
+  }
+  .benefit-icon.friend {
+    background: #1976d20f;
+    border: 1.5px solid #1976d230;
+  }
+  .benefit-label {
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: #999;
+    margin-bottom: 2px;
+  }
+  .benefit-value {
+    font-size: 1.05rem;
+    font-weight: 700;
+    color: #222;
+    line-height: 1.4;
+  }
+  .benefit-value .accent { color: #ff3300; }
+  .benefit-desc {
+    font-size: 0.8rem;
+    color: #888;
+    margin-top: 2px;
+  }
+
+  /* ---------- Form ---------- */
+  .form-section { margin-top: 8px; }
+  .input-group {
+    position: relative;
+    margin-bottom: 14px;
+  }
+  .input-group input {
+    width: 100%;
+    padding: 15px 16px;
+    border-radius: 8px;
+    border: 2px solid #e9ecef;
+    font-size: 1rem;
+    transition: border-color 0.2s;
+    outline: none;
+    background: #fafafa;
+  }
+  .input-group input:focus {
+    border-color: #222;
+    background: #fff;
+  }
+  .generate-btn {
+    display: block;
+    width: 100%;
+    padding: 16px;
+    background: #222;
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    font-size: 1.05rem;
+    font-weight: 700;
+    cursor: pointer;
+    transition: background 0.2s;
+  }
+  .generate-btn:hover { background: #000; }
+  .generate-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .error-text {
+    color: #dc3545;
+    font-size: 0.85rem;
+    margin-top: 10px;
+    display: none;
+    text-align: center;
+  }
+
+  /* ---------- Result ---------- */
+  .result-section { display: none; }
+  .link-label {
+    font-size: 0.8rem;
+    font-weight: 700;
+    color: #999;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-bottom: 10px;
+  }
+  .link-display {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    border: 2px solid #222;
+    border-radius: 8px;
+    overflow: hidden;
+    margin-bottom: 20px;
+  }
+  .link-display .link-text {
+    flex: 1;
+    padding: 14px 16px;
+    font-family: "SF Mono", "Fira Code", monospace;
+    font-size: 0.82rem;
+    word-break: break-all;
+    background: #fafafa;
+    color: #333;
+    line-height: 1.4;
+    border: none;
+    min-height: unset;
+  }
+  .link-display .copy-btn {
+    flex-shrink: 0;
+    padding: 14px 20px;
+    background: #222;
+    color: #fff;
+    border: none;
+    font-size: 0.85rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.2s;
+    white-space: nowrap;
+  }
+  .link-display .copy-btn:hover { background: #000; }
+  .link-display .copy-btn.copied {
+    background: #2e7d32;
+  }
+
+  /* ---------- Share Buttons ---------- */
+  .share-section {
+    margin-bottom: 24px;
+  }
+  .share-label {
+    font-size: 0.8rem;
+    font-weight: 700;
+    color: #999;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-bottom: 10px;
+  }
+  .share-buttons {
+    display: flex;
+    gap: 10px;
+  }
+  .share-btn {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 12px 16px;
+    border-radius: 8px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    text-decoration: none;
+    cursor: pointer;
+    border: none;
+    transition: opacity 0.2s;
+  }
+  .share-btn:hover { opacity: 0.85; }
+  .share-btn.x-btn {
+    background: #0f1419;
+    color: #fff;
+  }
+  .share-btn.line-btn {
+    background: #06C755;
+    color: #fff;
+  }
+  .share-btn svg {
+    width: 18px;
+    height: 18px;
+    flex-shrink: 0;
+  }
+
+  /* ---------- Stats ---------- */
+  .stats-row {
+    display: flex;
+    gap: 12px;
+    margin-top: 4px;
+  }
+  .stat-card {
+    flex: 1;
+    background: #f8f9fa;
+    border-radius: 10px;
+    padding: 18px 12px;
+    text-align: center;
+    border: 1px solid #eee;
+  }
+  .stat-number {
+    font-size: 2rem;
+    font-weight: 800;
+    color: #222;
+    line-height: 1;
+    margin-bottom: 4px;
+  }
+  .stat-number.accent { color: #ff3300; }
+  .stat-unit {
+    font-size: 0.9rem;
+    font-weight: 700;
+    color: #222;
+  }
+  .stat-label {
+    font-size: 0.75rem;
+    color: #999;
+    margin-top: 4px;
+  }
+
+  /* ---------- How It Works ---------- */
+  .how-section {
+    padding: 0;
+  }
+  .how-title {
+    font-size: 0.8rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #999;
+    margin-bottom: 16px;
+  }
+  .step-list {
+    list-style: none;
+    counter-reset: steps;
+  }
+  .step-list li {
+    counter-increment: steps;
+    display: flex;
+    align-items: flex-start;
+    gap: 14px;
+    padding: 10px 0;
+    font-size: 0.9rem;
+    color: #555;
+    line-height: 1.5;
+  }
+  .step-list li::before {
+    content: counter(steps);
+    flex-shrink: 0;
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    background: #222;
+    color: #fff;
+    font-size: 0.75rem;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-top: 1px;
+  }
+
+  /* ---------- Back Link ---------- */
+  .back-link {
+    display: block;
+    text-align: center;
+    margin-top: 20px;
+    color: #999;
+    text-decoration: none;
+    font-size: 0.85rem;
+    transition: color 0.2s;
+  }
+  .back-link:hover { color: #333; }
+
+  /* ---------- Responsive ---------- */
+  @media (max-width: 480px) {
+    body { padding: 16px; }
+    .card { padding: 28px 20px; }
+    .header h1 { font-size: 1.6rem; }
+    .share-buttons { flex-direction: column; }
+    .stat-number { font-size: 1.6rem; }
+    .link-display { flex-direction: column; }
+    .link-display .copy-btn { width: 100%; padding: 12px; }
+  }
 </style>
-<div class="container">
-  <h1>紹介プログラム</h1>
-  <p class="subtitle">仲間を紹介して、お互いに初月¥1,000 OFF</p>
 
-  <div class="reward-box">
-    <strong>紹介者特典</strong>: 紹介成功で次月¥1,000 OFF<br>
-    <strong>新規入会者特典</strong>: 初月¥1,000 OFF
+<div class="page-wrapper">
+
+  <!-- Header -->
+  <div class="header">
+    <span class="header-badge">Member Referral</span>
+    <h1>紹介プログラム</h1>
+    <p class="subtitle">仲間を紹介して、おトクに活動しよう</p>
   </div>
 
-  <div id="form-section">
-    <input type="email" id="ref-email" placeholder="登録メールアドレス" required>
-    <button class="btn" id="generate-btn" onclick="generateLink()">紹介リンクを取得</button>
-    <p class="error" id="ref-error"></p>
-  </div>
+  <!-- Benefits Card -->
+  <div class="card">
+    <div class="benefits-title">特典内容</div>
 
-  <div class="result" id="result-section">
-    <p style="font-weight:600; margin-bottom:8px;">あなたの紹介リンク:</p>
-    <div class="link-box" id="ref-link"></div>
-    <button class="copy-btn" onclick="copyLink()">コピーする</button>
-    <div class="stats">
-      <div class="stat">
-        <div class="stat-num" id="ref-count">0</div>
-        <div class="stat-label">紹介成功</div>
+    <div class="benefit-row">
+      <div class="benefit-icon you">
+        <span>&#127873;</span>
       </div>
-      <div class="stat">
-        <div class="stat-num" id="ref-code-display">-</div>
-        <div class="stat-label">コード</div>
+      <div>
+        <div class="benefit-label">あなた（紹介者）</div>
+        <div class="benefit-value">月額 <span class="accent">&yen;1,000 OFF</span></div>
+        <div class="benefit-desc">紹介された方が加入している間ずっと適用</div>
       </div>
     </div>
-    <p style="margin-top:16px; font-size:0.85rem; color:#666;">このリンクをSNSやメールで共有してください。リンク経由で入会した方に自動で割引が適用されます。</p>
+
+    <div class="benefit-row">
+      <div class="benefit-icon friend">
+        <span>&#127775;</span>
+      </div>
+      <div>
+        <div class="benefit-label">お友達（被紹介者）</div>
+        <div class="benefit-value">初月 <span class="accent">&yen;1,000 OFF</span></div>
+        <div class="benefit-desc">入会時に自動で割引が適用されます</div>
+      </div>
+    </div>
   </div>
 
-  <a class="back" href="/">← トップへ戻る</a>
+  <!-- Form / Result Card -->
+  <div class="card">
+
+    <!-- Form (before generating link) -->
+    <div class="form-section" id="form-section">
+      <div class="input-group">
+        <input type="email" id="ref-email" placeholder="登録メールアドレスを入力" required>
+      </div>
+      <button class="generate-btn" id="generate-btn" onclick="generateLink()">紹介リンクを取得</button>
+      <p class="error-text" id="ref-error"></p>
+    </div>
+
+    <!-- Result (after generating link) -->
+    <div class="result-section" id="result-section">
+      <div class="link-label">あなたの紹介リンク</div>
+      <div class="link-display">
+        <div class="link-text" id="ref-link"></div>
+        <button class="copy-btn" id="copy-btn" onclick="copyLink()">コピー</button>
+      </div>
+
+      <!-- Share Buttons -->
+      <div class="share-section">
+        <div class="share-label">シェアする</div>
+        <div class="share-buttons">
+          <a class="share-btn x-btn" id="share-x" href="#" target="_blank" rel="noopener">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+            X (Twitter)
+          </a>
+          <a class="share-btn line-btn" id="share-line" href="#" target="_blank" rel="noopener">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M19.365 9.863c.349 0 .63.285.63.631 0 .345-.281.63-.63.63H17.61v1.125h1.755c.349 0 .63.283.63.63 0 .344-.281.629-.63.629h-2.386c-.345 0-.627-.285-.627-.629V8.108c0-.345.282-.63.63-.63h2.386c.346 0 .627.285.627.63 0 .349-.281.63-.63.63H17.61v1.125h1.755zm-3.855 3.016c0 .27-.174.51-.432.596-.064.021-.133.031-.199.031-.211 0-.391-.09-.51-.25l-2.443-3.317v2.94c0 .344-.279.629-.631.629-.346 0-.626-.285-.626-.629V8.108c0-.27.173-.51.43-.595.06-.023.136-.033.194-.033.195 0 .375.104.495.254l2.462 3.33V8.108c0-.345.282-.63.63-.63.345 0 .63.285.63.63v4.771zm-5.741 0c0 .344-.282.629-.631.629-.345 0-.627-.285-.627-.629V8.108c0-.345.282-.63.63-.63.346 0 .628.285.628.63v4.771zm-2.466.629H4.917c-.345 0-.63-.285-.63-.629V8.108c0-.345.285-.63.63-.63.348 0 .63.285.63.63v4.141h1.756c.348 0 .629.283.629.63 0 .344-.282.629-.629.629M24 10.314C24 4.943 18.615.572 12 .572S0 4.943 0 10.314c0 4.811 4.27 8.842 10.035 9.608.391.082.923.258 1.058.59.12.301.079.766.038 1.08l-.164 1.02c-.045.301-.24 1.186 1.049.645 1.291-.539 6.916-4.078 9.436-6.975C23.176 14.393 24 12.458 24 10.314"/></svg>
+            LINE
+          </a>
+        </div>
+      </div>
+
+      <!-- Stats -->
+      <div class="stats-row">
+        <div class="stat-card">
+          <div class="stat-number" id="ref-count">0</div>
+          <div class="stat-unit">人</div>
+          <div class="stat-label">紹介成功</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-number accent" id="ref-discount">&yen;0</div>
+          <div class="stat-unit">/ 月</div>
+          <div class="stat-label">現在の割引額</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-number" id="ref-code-display" style="font-size:1rem; margin-top:8px;">-</div>
+          <div class="stat-label" style="margin-top:8px;">あなたのコード</div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- How It Works Card -->
+  <div class="card how-section">
+    <div class="how-title">ご利用の流れ</div>
+    <ol class="step-list">
+      <li>上記フォームで紹介リンクを取得</li>
+      <li>リンクをSNS・メール・LINEで友達にシェア</li>
+      <li>友達がリンク経由で入会すると割引が自動適用</li>
+      <li>紹介人数に制限なし &#8212; 紹介するほどおトク</li>
+    </ol>
+  </div>
+
+  <a class="back-link" href="/">&larr; トップへ戻る</a>
 </div>
+
 <script>
   async function generateLink() {
-    const email = document.getElementById('ref-email').value;
-    const btn = document.getElementById('generate-btn');
-    const errDiv = document.getElementById('ref-error');
+    var email = document.getElementById('ref-email').value;
+    var btn = document.getElementById('generate-btn');
+    var errDiv = document.getElementById('ref-error');
     errDiv.style.display = 'none';
     btn.disabled = true;
     btn.textContent = '取得中...';
 
     try {
-      const resp = await fetch('/api/referral/generate', {
+      var resp = await fetch('/api/referral/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email })
+        body: JSON.stringify({ email: email })
       });
-      const data = await resp.json();
+      var data = await resp.json();
 
       if (!resp.ok) {
         errDiv.textContent = data.error || 'エラーが発生しました';
@@ -3445,12 +3841,24 @@ app.get('/referral', (_req, res) => {
         return;
       }
 
+      var refCount = data.referrals || 0;
+      var discount = refCount * 1000;
+
       document.getElementById('ref-link').textContent = data.link;
-      document.getElementById('ref-count').textContent = data.referrals || 0;
+      document.getElementById('ref-count').textContent = refCount;
+      document.getElementById('ref-discount').textContent = '\u00A5' + discount.toLocaleString();
       document.getElementById('ref-code-display').textContent = data.code;
       document.getElementById('form-section').style.display = 'none';
       document.getElementById('result-section').style.display = 'block';
-    } catch {
+
+      // Set up share URLs
+      var shareText = 'AI×建築サークルに一緒に入りませんか？紹介リンクから入会すると初月￥1,000 OFF！';
+      var link = encodeURIComponent(data.link);
+      var text = encodeURIComponent(shareText);
+
+      document.getElementById('share-x').href = 'https://twitter.com/intent/tweet?text=' + text + '%0A' + link;
+      document.getElementById('share-line').href = 'https://social-plugins.line.me/lineit/share?url=' + link + '&text=' + text;
+    } catch (e) {
       errDiv.textContent = 'ネットワークエラー';
       errDiv.style.display = 'block';
       btn.disabled = false;
@@ -3459,13 +3867,25 @@ app.get('/referral', (_req, res) => {
   }
 
   function copyLink() {
-    const link = document.getElementById('ref-link').textContent;
-    navigator.clipboard.writeText(link).then(() => {
-      const btn = document.querySelector('.copy-btn');
-      btn.textContent = 'コピーしました！';
-      setTimeout(() => btn.textContent = 'コピーする', 2000);
+    var link = document.getElementById('ref-link').textContent;
+    navigator.clipboard.writeText(link).then(function() {
+      var btn = document.getElementById('copy-btn');
+      btn.textContent = 'コピーしました';
+      btn.classList.add('copied');
+      setTimeout(function() {
+        btn.textContent = 'コピー';
+        btn.classList.remove('copied');
+      }, 2000);
     });
   }
+
+  // Allow Enter key to submit
+  document.getElementById('ref-email').addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      generateLink();
+    }
+  });
 </script>
   `;
   res.type('html').send(html);
