@@ -9,13 +9,17 @@
     "start": "node index.js",
     "setup": "bash scripts/setup.sh",
     "deploy": "bash scripts/deploy.sh",
-    "stripe:forward": "bash scripts/stripe-forward.sh"
+    "stripe:forward": "bash scripts/stripe-forward.sh",
+    "drip": "node drip_campaign.js",
+    "drip:status": "node drip_campaign.js --status",
+    "drip:dry": "node drip_campaign.js --dry-run"
   },
   "dependencies": {
     "@google-cloud/firestore": "^7.11.6",
     "discord.js": "^14.22.1",
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
+    "nodemailer": "^6.10.1",
     "pdfkit": "^0.17.2",
     "stripe": "^19.0.0"
   },
