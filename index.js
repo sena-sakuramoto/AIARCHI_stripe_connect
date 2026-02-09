@@ -156,6 +156,41 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
         await saveLinkCode(session.id, session.customer);
         console.log(`[webhook] saved link code for session ${session.id}, customer ${session.customer}`);
 
+        // リファラル完了処理
+        if (session.metadata && session.metadata.referral_code && firestore) {
+          try {
+            const refCode = session.metadata.referral_code;
+            const newEmail = session.customer_details?.email || session.customer_email || '';
+            const refSnap = await firestore.collection('referrals')
+              .where('code', '==', refCode).limit(1).get();
+            if (!refSnap.empty) {
+              const refDoc = refSnap.docs[0];
+              const refData = refDoc.data();
+              await refDoc.ref.update({
+                referrals: (refData.referrals || 0) + 1,
+                lastReferralAt: new Date().toISOString()
+              });
+              // 紹介者にクーポン適用
+              if (refData.couponId && refData.referrerCustomerId) {
+                const subs = await stripe.subscriptions.list({
+                  customer: refData.referrerCustomerId,
+                  status: 'active',
+                  limit: 1
+                });
+                if (subs.data.length > 0) {
+                  await stripe.subscriptions.update(subs.data[0].id, {
+                    coupon: refData.couponId
+                  });
+                  console.log(`[webhook] Applied referral reward to ${refData.referrerEmail}`);
+                }
+              }
+              console.log(`[webhook] Referral completed: ${refCode} → ${newEmail}`);
+            }
+          } catch (refErr) {
+            console.error('[webhook] Referral processing error:', refErr.message);
+          }
+        }
+
         // 会社名が入力されていたら顧客名を更新（領収書用）
         if (session.custom_fields && session.custom_fields.length > 0) {
           const companyField = session.custom_fields.find(f => f.key === 'company_name');
@@ -228,8 +263,42 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
 // 一般JSONは通常のparser
 app.use(express.json());
 
+// CORS（LP・ツールからのAPI呼び出し用）
+app.use((req, res, next) => {
+  const allowedOrigins = [
+    'https://archi-prisma.co.jp',
+    'https://ai-archi-circle.archi-prisma.co.jp',
+    'https://rakuraku-energy.archi-prisma.co.jp',
+    'https://kokome.archi-prisma.co.jp',
+    'http://localhost:5173',
+    'http://localhost:3000'
+  ];
+  const origin = req.headers.origin;
+  // 固定リスト + Firebase Hosting (*.web.app, *.firebaseapp.com)
+  const isAllowed = origin && (
+    allowedOrigins.some(o => origin.startsWith(o)) ||
+    /^https:\/\/[\w-]+\.(web\.app|firebaseapp\.com)$/.test(origin)
+  );
+  if (isAllowed) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+  }
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 // 静的ファイル配信（ロゴ等）
 const path = require('path');
+const nodemailer = require('nodemailer');
+
+// ------- Gmail SMTP トランスポーター（リード向けメール送信用） -------
+const gmailTransporter = (process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD)
+  ? nodemailer.createTransport({
+      service: 'gmail',
+      auth: { user: process.env.GMAIL_USER, pass: process.env.GMAIL_APP_PASSWORD }
+    })
+  : null;
 app.use('/public', express.static(path.join(__dirname, 'public')));
 
 // ---- ヘルス & ルート ----
@@ -250,128 +319,274 @@ app.get('/', (_req, res) => {
     align-items: center;
     justify-content: center;
     color: #333;
+    padding: 24px;
   }
   .container {
-    max-width: 500px;
+    max-width: 540px;
+    width: 100%;
     text-align: center;
-    padding: 48px 24px;
+    padding: 48px 28px;
     background: white;
-    border-radius: 8px;
+    border-radius: 12px;
     border: 1px solid #e9ecef;
-    box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+    box-shadow: 0 8px 30px rgba(0,0,0,0.08);
   }
-  h1 { font-size: 2.2rem; margin-bottom: 16px; font-weight: 600; }
-  .subtitle { font-size: 1.1rem; color: #666; margin-bottom: 32px; }
-  .features { text-align: left; margin-bottom: 32px; }
-  .feature { display: flex; align-items: center; margin-bottom: 12px; font-size: 1rem; }
-  .feature::before { content: "•"; margin-right: 12px; color: #666; font-weight: bold; }
+  h1 { font-size: 2rem; margin-bottom: 8px; font-weight: 700; }
+  .subtitle { font-size: 1rem; color: #666; margin-bottom: 28px; }
+
+  /* Plan Tabs */
+  .plan-tabs {
+    display: flex;
+    gap: 0;
+    margin-bottom: 28px;
+    border-radius: 8px;
+    overflow: hidden;
+    border: 2px solid #222;
+  }
+  .plan-tab {
+    flex: 1;
+    padding: 12px 8px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    cursor: pointer;
+    background: #fff;
+    color: #333;
+    border: none;
+    transition: all 0.2s;
+    position: relative;
+  }
+  .plan-tab:not(:last-child) { border-right: 1px solid #ddd; }
+  .plan-tab.active {
+    background: #222;
+    color: #fff;
+  }
+  .plan-tab .badge {
+    display: block;
+    font-size: 0.65rem;
+    font-weight: 700;
+    color: #ff3300;
+    margin-top: 2px;
+  }
+  .plan-tab.active .badge { color: #ff6644; }
+
+  .plan-price {
+    font-size: 2.8rem;
+    font-weight: 800;
+    margin-bottom: 4px;
+    line-height: 1;
+  }
+  .plan-period {
+    font-size: 0.9rem;
+    color: #888;
+    margin-bottom: 4px;
+  }
+  .plan-savings {
+    font-size: 0.8rem;
+    color: #ff3300;
+    font-weight: 600;
+    margin-bottom: 20px;
+    min-height: 1.2em;
+  }
+
+  .features { text-align: left; margin-bottom: 28px; }
+  .feature {
+    display: flex;
+    align-items: center;
+    margin-bottom: 10px;
+    font-size: 0.95rem;
+  }
+  .feature::before { content: "\\2713"; margin-right: 10px; color: #222; font-weight: bold; }
+
   .btn {
     display: inline-block;
     padding: 14px 28px;
     background: #fff;
     color: #333;
     text-decoration: none;
-    border-radius: 4px;
+    border-radius: 6px;
     font-size: 1rem;
     font-weight: 500;
     margin: 8px;
     border: 2px solid #333;
     transition: all 0.2s ease;
   }
-  .btn:hover {
-    background: #333;
-    color: #fff;
-  }
+  .btn:hover { background: #333; color: #fff; }
   .btn.primary {
-    background: #333;
+    background: #222;
     color: #fff;
+    width: 100%;
+    padding: 16px;
+    font-size: 1.05rem;
+    font-weight: 700;
+    border: none;
+    cursor: pointer;
   }
-  .btn.primary:hover {
-    background: #000;
-  }
+  .btn.primary:hover { background: #000; }
+  .btn.primary:disabled { opacity: 0.5; cursor: not-allowed; }
+
   .cancel-section {
-    margin-top: 48px;
-    padding-top: 32px;
+    margin-top: 40px;
+    padding-top: 28px;
     border-top: 1px solid #e9ecef;
   }
   .cancel-section h3 {
-    font-size: 1.1rem;
-    margin-bottom: 16px;
+    font-size: 1rem;
+    margin-bottom: 12px;
     color: #666;
   }
   .mode-badge {
-    position: absolute;
-    top: 20px;
-    right: 20px;
+    position: fixed;
+    top: 16px;
+    right: 16px;
     padding: 6px 12px;
     background: ${CFG.STRIPE_MODE === 'live' ? '#000' : '#666'};
     color: white;
     border-radius: 4px;
-    font-size: 0.8rem;
+    font-size: 0.75rem;
     font-weight: 500;
+    z-index: 100;
+  }
+  .student-note {
+    font-size: 0.75rem;
+    color: #888;
+    margin-top: 12px;
   }
 </style>
 <div class="mode-badge">${CFG.STRIPE_MODE === 'live' ? 'LIVE' : 'TEST'}</div>
 <div class="container">
   <h1>AI×建築サークル</h1>
-  <p class="subtitle">Proメンバーシップ</p>
+  <p class="subtitle">メンバーシップ登録</p>
+
+  <!-- Plan Selector Tabs -->
+  <div class="plan-tabs">
+    <button class="plan-tab" data-plan="yearly" onclick="selectPlan('yearly')">
+      年間プラン
+      <span class="badge">2ヶ月分お得</span>
+    </button>
+    <button class="plan-tab active" data-plan="monthly" onclick="selectPlan('monthly')">
+      月額プラン
+    </button>
+    <button class="plan-tab" data-plan="student" onclick="selectPlan('student')">
+      学割
+      <span class="badge">60%OFF</span>
+    </button>
+  </div>
+
+  <!-- Dynamic Price Display -->
+  <div class="plan-price" id="plan-price">¥5,000</div>
+  <div class="plan-period" id="plan-period">/ 月（税込）</div>
+  <div class="plan-savings" id="plan-savings">&nbsp;</div>
 
   <div class="features">
-    <div class="feature">Pro限定チャンネルアクセス</div>
-    <div class="feature">専用サポート</div>
-    <div class="feature">月額 ¥5,000</div>
-    <div class="feature" style="color: #28a745; font-weight: 600;">学生は月額 ¥2,000（.ac.jp / .edu / .ed.jp）</div>
+    <div class="feature">Sena主催セミナーに無料参加</div>
+    <div class="feature">アーカイブ動画 見放題</div>
+    <div class="feature">Sena開発ツール 利用権</div>
+    <div class="feature">Discordコミュニティ参加</div>
     <div class="feature">いつでも解約可能</div>
   </div>
 
   <form id="checkout-form" style="margin-bottom: 16px;">
-    <div style="margin-bottom: 16px;">
-      <label for="email-input" style="display: block; margin-bottom: 8px; font-weight: 500;">メールアドレス</label>
+    <div style="margin-bottom: 14px;">
       <input
         type="email"
         id="email-input"
-        placeholder="your@example.com"
+        placeholder="メールアドレス"
         required
-        style="width: 100%; padding: 12px 16px; border-radius: 4px; border: 1px solid #e9ecef; font-size: 1rem;"
+        style="width: 100%; padding: 14px 16px; border-radius: 6px; border: 1px solid #ddd; font-size: 1rem;"
       >
     </div>
-    <div style="margin-bottom: 16px;">
-      <label for="company-input" style="display: block; margin-bottom: 8px; font-weight: 500;">会社名 <span style="color: #888; font-weight: normal;">（任意・領収書の宛名になります）</span></label>
+    <div style="margin-bottom: 14px;">
       <input
         type="text"
         id="company-input"
-        placeholder="株式会社〇〇"
-        style="width: 100%; padding: 12px 16px; border-radius: 4px; border: 1px solid #e9ecef; font-size: 1rem;"
+        placeholder="会社名（任意・領収書の宛名）"
+        style="width: 100%; padding: 14px 16px; border-radius: 6px; border: 1px solid #ddd; font-size: 1rem;"
       >
     </div>
     <button type="submit" class="btn primary" id="checkout-btn">
-      今すぐ参加
+      今すぐ参加する
     </button>
-    <div id="error-message" style="color: #dc3545; margin-top: 16px; display: none;"></div>
-    <div id="warning-message" style="color: #ff9800; margin-top: 16px; display: none;"></div>
+    <div id="error-message" style="color: #dc3545; margin-top: 12px; display: none; font-size: 0.9rem;"></div>
+    <div id="warning-message" style="color: #ff9800; margin-top: 12px; display: none; font-size: 0.9rem;"></div>
+    <p class="student-note" id="student-note" style="display:none;">※ 学割は .ac.jp / .edu / .ed.jp ドメインのメールアドレスが対象です</p>
   </form>
 
+  <div id="referral-banner" style="display:none; margin-bottom:16px; padding:12px; background:#e8f5e9; border:1px solid #66bb6a; border-radius:6px; color:#2e7d32; font-size:0.9rem; text-align:center;">
+    <strong>紹介コード適用中</strong> ― 紹介者特典で初月割引が適用されます
+  </div>
+  <input type="hidden" id="referral-code" value="">
+  <input type="hidden" id="selected-plan" value="monthly">
+
   <script>
+    const PLANS = {
+      yearly:  { price: '¥50,000', period: '/ 年（税込）', savings: '月あたり約¥4,167 ― 年間¥10,000お得', priceId: '${PRICE_IDS.yearly || ''}' },
+      monthly: { price: '¥5,000',  period: '/ 月（税込）', savings: '',                                     priceId: '${PRICE_IDS.monthly || ''}' },
+      student: { price: '¥2,000',  period: '/ 月（税込）', savings: '学生限定 ― 通常の60%OFF',              priceId: '${PRICE_IDS.student || ''}' }
+    };
+
+    function selectPlan(plan) {
+      document.getElementById('selected-plan').value = plan;
+      document.querySelectorAll('.plan-tab').forEach(t => t.classList.remove('active'));
+      document.querySelector('[data-plan="'+plan+'"]').classList.add('active');
+      document.getElementById('plan-price').textContent = PLANS[plan].price;
+      document.getElementById('plan-period').textContent = PLANS[plan].period;
+      document.getElementById('plan-savings').innerHTML = PLANS[plan].savings || '&nbsp;';
+      document.getElementById('student-note').style.display = plan === 'student' ? 'block' : 'none';
+    }
+
+    // URLパラメータからプラン指定を読み取る
+    (function() {
+      const params = new URLSearchParams(window.location.search);
+      const plan = params.get('plan');
+      if (plan && PLANS[plan]) {
+        selectPlan(plan);
+      }
+
+      // リファラルコード検出
+      const ref = params.get('ref');
+      if (ref) {
+        document.getElementById('referral-code').value = ref;
+        fetch('/api/referral/verify/' + encodeURIComponent(ref))
+          .then(r => r.json())
+          .then(data => {
+            if (data.ok && data.valid) {
+              document.getElementById('referral-banner').style.display = 'block';
+            }
+          })
+          .catch(() => {});
+      }
+    })();
+
     document.getElementById('checkout-form').addEventListener('submit', async (e) => {
       e.preventDefault();
 
       const btn = document.getElementById('checkout-btn');
       const email = document.getElementById('email-input').value;
       const companyName = document.getElementById('company-input').value;
+      const referralCode = document.getElementById('referral-code').value;
+      const selectedPlan = document.getElementById('selected-plan').value;
       const errorDiv = document.getElementById('error-message');
       const warningDiv = document.getElementById('warning-message');
 
-      // リセット
       errorDiv.style.display = 'none';
       warningDiv.style.display = 'none';
       btn.disabled = true;
       btn.textContent = '処理中...';
 
       try {
+        const body = { email, companyName };
+        if (referralCode) body.referralCode = referralCode;
+
+        // 選択されたプランのpriceIdを送信
+        const planData = PLANS[selectedPlan];
+        if (planData && planData.priceId) {
+          body.priceId = planData.priceId;
+        }
+
         const response = await fetch('/api/create-checkout-session', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email, companyName })
+          body: JSON.stringify(body)
         });
 
         const data = await response.json();
@@ -380,7 +595,7 @@ app.get('/', (_req, res) => {
           errorDiv.textContent = data.message || 'エラーが発生しました';
           errorDiv.style.display = 'block';
           btn.disabled = false;
-          btn.textContent = '今すぐ参加';
+          btn.textContent = '今すぐ参加する';
           return;
         }
 
@@ -389,22 +604,22 @@ app.get('/', (_req, res) => {
           warningDiv.style.display = 'block';
         }
 
-        // Stripe Checkoutページへリダイレクト
         window.location.href = data.url;
 
       } catch (error) {
         errorDiv.textContent = 'ネットワークエラーが発生しました';
         errorDiv.style.display = 'block';
         btn.disabled = false;
-        btn.textContent = '今すぐ参加';
+        btn.textContent = '今すぐ参加する';
       }
     });
   </script>
 
   <div class="cancel-section">
     <h3>既存メンバー</h3>
-    <p style="margin-bottom: 16px; color: #666;">管理・解約はこちら</p>
+    <p style="margin-bottom: 12px; color: #666;">管理・解約はこちら</p>
     <a class="btn" href="/portal-lookup">請求管理</a>
+    <a class="btn" href="/referral" style="margin-top: 8px;">紹介リンク取得</a>
   </div>
 </div>
   `;
@@ -821,7 +1036,7 @@ app.get('/portal', async (req, res) => {
 
 // Checkout Session作成API（二重契約・トライアル再利用防止付き）
 app.post('/api/create-checkout-session', async (req, res) => {
-  const { email, priceId, mode, companyName } = req.body;
+  const { email, priceId, mode, companyName, referralCode } = req.body;
 
   if (!email) {
     return res.status(400).json({ error: 'Email is required' });
@@ -910,9 +1125,36 @@ app.post('/api/create-checkout-session', async (req, res) => {
       success_url: `${base}/oauth/discord/start?code={CHECKOUT_SESSION_ID}`,
       cancel_url: `${base}/?canceled=true`,
       metadata: {
-        source: 'api_checkout'
+        source: 'api_checkout',
+        ...(referralCode ? { referral_code: referralCode } : {})
       }
     };
+
+    // リファラルコードがある場合、新規会員にも割引を適用
+    if (referralCode && firestore) {
+      try {
+        const refSnap = await firestore.collection('referrals')
+          .where('code', '==', referralCode).limit(1).get();
+        if (!refSnap.empty) {
+          const refData = refSnap.docs[0].data();
+          if (refData.couponId) {
+            // 新規会員用クーポンを別途作成（初月1,000円OFF）
+            const newMemberCoupon = await stripe.coupons.create({
+              amount_off: 1000,
+              currency: 'jpy',
+              duration: 'once',
+              name: `紹介割引 (${referralCode})`,
+              metadata: { referral_code: referralCode, type: 'new_member' }
+            });
+            sessionParams.discounts = [{ coupon: newMemberCoupon.id }];
+            delete sessionParams.allow_promotion_codes; // discountsと併用不可
+            console.log(`[checkout] Applied referral coupon for code: ${referralCode}`);
+          }
+        }
+      } catch (err) {
+        console.warn('[checkout] Referral coupon lookup failed:', err.message);
+      }
+    }
 
     // トライアル設定なし（クーポンで対応）
 
@@ -2444,6 +2686,1073 @@ app.get('/aifes-old', (req, res) => {
 </html>
   `;
   res.type('html').send(html);
+});
+
+// ------- AI FES. アーカイブ動画ページ -------
+
+// AI FES Price ID → セッションマッピング
+const AIFES_PRICE_MAP = {
+  'price_1Squ8URpUEcUjSDNMitC1StT': {
+    name: 'AI FES. 参加チケット（1日通し）',
+    sessions: ['A', 'B', 'C', 'D', 'E1', 'E2', 'F']
+  },
+  'price_1Squ8VRpUEcUjSDNmzZ6QliV': {
+    name: '第２回実務で使えるAI×建築セミナー',
+    sessions: ['C', 'F']
+  },
+  'price_1Squ8WRpUEcUjSDNiU9RiUXF': {
+    name: '今使える画像生成AIセミナー（第２回開催）',
+    sessions: ['D', 'F']
+  },
+  'price_1Squ8XRpUEcUjSDNUkqyg2jm': {
+    name: 'Googleサービスでつくる無料HP＆業務自動化（GAS）セミナー（第１回開催）',
+    sessions: ['E1', 'E2', 'F']
+  }
+};
+
+// セッション情報（★YouTubeリンクを設定する★）
+const AIFES_SESSIONS = {
+  'A': {
+    name: '開幕＋最新AI Newsまとめ（建築業界向け sena流）',
+    desc: 'AI FES. 2026 オープニング＋直近30日間の主要AIアップデートを建築実務の視点で解説',
+    youtubeId: 'XXXXXX' // ← YouTube動画IDを設定
+  },
+  'B': {
+    name: '自社プロダクト（COMPASS/SpotPDF/KAKOME）使い方',
+    desc: 'AI×建築サークルが開発した3つのプロダクトを実演付きで紹介',
+    youtubeId: 'XXXXXX'
+  },
+  'C': {
+    name: '第２回実務で使えるAI×建築セミナー',
+    desc: 'ChatGPT / Claude / Gemini の使い分けと建築実務での活用法',
+    youtubeId: 'XXXXXX'
+  },
+  'D': {
+    name: '今使える画像生成AIセミナー（第２回開催）',
+    desc: 'Nano Banana Pro × 建築パース実践ワークフロー',
+    youtubeId: 'XXXXXX'
+  },
+  'E1': {
+    name: '業務自動化（GAS）セミナー',
+    desc: 'Google Apps Scriptで見積・工程・メールを自動化',
+    youtubeId: 'XXXXXX'
+  },
+  'E2': {
+    name: 'Googleサービスでつくる無料HP',
+    desc: '建築事務所のWeb集客をゼロ円で始める方法',
+    youtubeId: 'XXXXXX'
+  },
+  'F': {
+    name: '質問タイム',
+    desc: '建築×AIのリアルな疑問に回答するガチ質問タイム',
+    youtubeId: 'XXXXXX'
+  }
+};
+
+// アーカイブ: メール入力フォーム
+app.get('/archive', (req, res) => {
+  const html = `
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI FES. 2026 アーカイブ動画</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Hiragino Sans', 'Hiragino Kaku Gothic ProN', Meiryo, sans-serif;
+      background: #0a0a1a;
+      min-height: 100vh;
+      color: #fff;
+    }
+    .container {
+      max-width: 480px;
+      margin: 0 auto;
+      padding: 60px 20px;
+      text-align: center;
+    }
+    .logo {
+      font-size: 14px;
+      letter-spacing: 4px;
+      color: #667eea;
+      margin-bottom: 8px;
+      text-transform: uppercase;
+    }
+    h1 {
+      font-size: 28px;
+      font-weight: 700;
+      margin-bottom: 12px;
+      background: linear-gradient(135deg, #667eea, #764ba2);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .subtitle {
+      color: #888;
+      font-size: 14px;
+      margin-bottom: 48px;
+      line-height: 1.6;
+    }
+    .form-box {
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 16px;
+      padding: 32px 24px;
+    }
+    .form-box label {
+      display: block;
+      text-align: left;
+      font-size: 13px;
+      color: #aaa;
+      margin-bottom: 8px;
+    }
+    .form-box input[type="email"] {
+      width: 100%;
+      padding: 14px 16px;
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 8px;
+      background: rgba(255,255,255,0.08);
+      color: #fff;
+      font-size: 16px;
+      outline: none;
+      transition: border 0.2s;
+    }
+    .form-box input[type="email"]:focus {
+      border-color: #667eea;
+    }
+    .form-box input[type="email"]::placeholder {
+      color: #555;
+    }
+    .btn {
+      display: block;
+      width: 100%;
+      margin-top: 16px;
+      padding: 14px;
+      border: none;
+      border-radius: 8px;
+      background: linear-gradient(135deg, #667eea, #764ba2);
+      color: #fff;
+      font-size: 16px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.2s;
+    }
+    .btn:hover { opacity: 0.9; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .error {
+      margin-top: 16px;
+      padding: 12px;
+      background: rgba(220,53,69,0.15);
+      border: 1px solid rgba(220,53,69,0.3);
+      border-radius: 8px;
+      color: #ff6b6b;
+      font-size: 14px;
+      display: none;
+    }
+    .note {
+      margin-top: 24px;
+      font-size: 12px;
+      color: #555;
+      line-height: 1.6;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="logo">AI FES. 2026</div>
+    <h1>アーカイブ動画</h1>
+    <p class="subtitle">
+      ご購入時のメールアドレスを入力してください。<br>
+      購入内容に応じた動画をご視聴いただけます。
+    </p>
+    <div class="form-box">
+      <form id="archiveForm">
+        <label for="email">メールアドレス</label>
+        <input type="email" id="email" name="email" placeholder="example@mail.com" required autocomplete="email">
+        <button type="submit" class="btn" id="submitBtn">動画を見る</button>
+      </form>
+      <div class="error" id="errorMsg"></div>
+    </div>
+    <p class="note">
+      ※ Stripe決済時に使用したメールアドレスをご入力ください。<br>
+      ※ ご不明な場合はお問い合わせフォームよりご連絡ください。
+    </p>
+  </div>
+  <script>
+    const form = document.getElementById('archiveForm');
+    const btn = document.getElementById('submitBtn');
+    const errEl = document.getElementById('errorMsg');
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      errEl.style.display = 'none';
+      btn.disabled = true;
+      btn.textContent = '確認中...';
+      try {
+        const email = document.getElementById('email').value.trim();
+        const res = await fetch('/archive/verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email })
+        });
+        if (!res.ok) {
+          const data = await res.json();
+          throw new Error(data.error || '認証に失敗しました');
+        }
+        const html = await res.text();
+        document.open();
+        document.write(html);
+        document.close();
+      } catch (err) {
+        errEl.textContent = err.message;
+        errEl.style.display = 'block';
+        btn.disabled = false;
+        btn.textContent = '動画を見る';
+      }
+    });
+  </script>
+</body>
+</html>`;
+  res.type('html').send(html);
+});
+
+// アーカイブ: メール認証 → 動画ページ
+app.post('/archive/verify', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) {
+      return res.status(400).json({ error: 'メールアドレスを入力してください' });
+    }
+
+    const normalizedEmail = email.trim().toLowerCase();
+
+    // Stripe Checkout Sessionsから購入履歴を検索
+    const allSessions = [];
+    let hasMore = true;
+    let startingAfter = null;
+
+    while (hasMore) {
+      const params = { limit: 100 };
+      if (startingAfter) params.starting_after = startingAfter;
+
+      const checkoutSessions = await stripe.checkout.sessions.list(params);
+
+      for (const session of checkoutSessions.data) {
+        if (session.payment_status !== 'paid') continue;
+
+        const sessionEmail = (
+          session.customer_details?.email ||
+          session.customer_email ||
+          ''
+        ).trim().toLowerCase();
+
+        if (sessionEmail !== normalizedEmail) continue;
+
+        // line_itemsを取得
+        const lineItems = await stripe.checkout.sessions.listLineItems(session.id);
+        for (const item of lineItems.data) {
+          const priceId = item.price?.id;
+          if (priceId && AIFES_PRICE_MAP[priceId]) {
+            allSessions.push({
+              priceId,
+              productName: AIFES_PRICE_MAP[priceId].name,
+              sessions: AIFES_PRICE_MAP[priceId].sessions
+            });
+          }
+        }
+      }
+
+      hasMore = checkoutSessions.has_more;
+      if (checkoutSessions.data.length > 0) {
+        startingAfter = checkoutSessions.data[checkoutSessions.data.length - 1].id;
+      }
+    }
+
+    if (allSessions.length === 0) {
+      return res.status(404).json({
+        error: 'このメールアドレスでの購入履歴が見つかりませんでした。購入時のメールアドレスをご確認ください。'
+      });
+    }
+
+    // 重複除去してセッション一覧を作成
+    const purchasedProducts = [];
+    const grantedSessions = new Set();
+    const seenPriceIds = new Set();
+
+    for (const purchase of allSessions) {
+      if (!seenPriceIds.has(purchase.priceId)) {
+        seenPriceIds.add(purchase.priceId);
+        purchasedProducts.push(purchase.productName);
+        purchase.sessions.forEach(s => grantedSessions.add(s));
+      }
+    }
+
+    const sortedSessions = Array.from(grantedSessions).sort();
+
+    // 動画ページHTMLを生成
+    const videoCards = sortedSessions.map(key => {
+      const s = AIFES_SESSIONS[key];
+      if (!s) return '';
+      const hasVideo = s.youtubeId && s.youtubeId !== 'XXXXXX';
+      return `
+        <div class="video-card">
+          <div class="video-wrapper">
+            ${hasVideo
+              ? `<iframe src="https://www.youtube.com/embed/${s.youtubeId}" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>`
+              : `<div class="video-placeholder">準備中</div>`
+            }
+          </div>
+          <div class="video-info">
+            <h3>${s.name}</h3>
+            <p>${s.desc}</p>
+          </div>
+        </div>`;
+    }).join('');
+
+    const productListHtml = purchasedProducts.map(p => `<span class="tag">${p}</span>`).join('');
+
+    const html = `
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI FES. 2026 アーカイブ動画</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Hiragino Sans', 'Hiragino Kaku Gothic ProN', Meiryo, sans-serif;
+      background: #0a0a1a;
+      min-height: 100vh;
+      color: #fff;
+    }
+    .header {
+      background: linear-gradient(135deg, rgba(102,126,234,0.15), rgba(118,75,162,0.15));
+      border-bottom: 1px solid rgba(255,255,255,0.08);
+      padding: 24px 20px;
+      text-align: center;
+    }
+    .header .logo {
+      font-size: 12px;
+      letter-spacing: 4px;
+      color: #667eea;
+      text-transform: uppercase;
+    }
+    .header h1 {
+      font-size: 22px;
+      margin-top: 4px;
+      font-weight: 700;
+    }
+    .container {
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 32px 20px 60px;
+    }
+    .purchase-info {
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 12px;
+      padding: 20px;
+      margin-bottom: 32px;
+    }
+    .purchase-info .label {
+      font-size: 12px;
+      color: #888;
+      margin-bottom: 8px;
+    }
+    .tag {
+      display: inline-block;
+      background: rgba(102,126,234,0.2);
+      border: 1px solid rgba(102,126,234,0.3);
+      color: #a5b4fc;
+      padding: 4px 12px;
+      border-radius: 20px;
+      font-size: 13px;
+      margin: 4px 4px 4px 0;
+    }
+    .video-card {
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 12px;
+      overflow: hidden;
+      margin-bottom: 24px;
+      transition: border-color 0.2s;
+    }
+    .video-card:hover {
+      border-color: rgba(102,126,234,0.3);
+    }
+    .video-wrapper {
+      position: relative;
+      padding-bottom: 56.25%; /* 16:9 */
+      background: #111;
+    }
+    .video-wrapper iframe {
+      position: absolute;
+      top: 0; left: 0;
+      width: 100%; height: 100%;
+    }
+    .video-placeholder {
+      position: absolute;
+      top: 0; left: 0;
+      width: 100%; height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #555;
+      font-size: 18px;
+    }
+    .video-info {
+      padding: 16px 20px;
+    }
+    .video-info h3 {
+      font-size: 16px;
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+    .video-info p {
+      font-size: 13px;
+      color: #888;
+    }
+    .warning {
+      margin-top: 32px;
+      padding: 16px;
+      background: rgba(255,193,7,0.1);
+      border: 1px solid rgba(255,193,7,0.2);
+      border-radius: 8px;
+      font-size: 13px;
+      color: #ffd54f;
+      line-height: 1.6;
+    }
+    .footer-note {
+      margin-top: 24px;
+      text-align: center;
+      font-size: 12px;
+      color: #444;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="logo">AI FES. 2026</div>
+    <h1>アーカイブ動画</h1>
+  </div>
+  <div class="container">
+    <div class="purchase-info">
+      <div class="label">ご購入商品</div>
+      ${productListHtml}
+    </div>
+    ${videoCards}
+    <div class="warning">
+      ⚠️ この動画は購入者様専用です。URLの共有・動画のダウンロード・再配布はご遠慮ください。
+    </div>
+    <div class="footer-note">
+      AI×建築サークル / AI FES. 2026
+    </div>
+  </div>
+</body>
+</html>`;
+
+    res.type('html').send(html);
+
+  } catch (err) {
+    console.error('[archive/verify] Error:', err);
+    res.status(500).json({ error: 'サーバーエラーが発生しました。時間をおいて再度お試しください。' });
+  }
+});
+
+// ------- リード獲得API（LP → ドリップキャンペーン連携） -------
+app.post('/api/capture', async (req, res) => {
+  try {
+    const { email, name, company } = req.body;
+    if (!email) {
+      return res.status(400).json({ error: 'メールアドレスは必須です' });
+    }
+
+    const normalizedEmail = email.trim().toLowerCase();
+    const leadData = {
+      email: normalizedEmail,
+      name: (name || '').trim(),
+      company: (company || '').trim(),
+      source: req.body.source || 'landing_page',
+      capturedAt: new Date().toISOString(),
+      dripStep: 0,
+      dripStartedAt: null,
+      status: 'new'
+    };
+
+    // Firestoreに保存
+    if (firestore) {
+      const existingSnap = await firestore.collection('leads')
+        .where('email', '==', normalizedEmail).limit(1).get();
+
+      if (!existingSnap.empty) {
+        // 既存リードはDB追加しないが、ガイドメールは再送する
+        console.log(`[capture] Existing lead (resending guide): ${normalizedEmail}`);
+      } else {
+        await firestore.collection('leads').add(leadData);
+        console.log(`[capture] New lead: ${normalizedEmail} (${leadData.company})`);
+      }
+    }
+
+    // drip_state.jsonにも追加（ドリップキャンペーン用）
+    const stateFile = path.join(__dirname, 'data', 'drip_state.json');
+    let state = { leads: [] };
+    try {
+      if (require('fs').existsSync(stateFile)) {
+        state = JSON.parse(require('fs').readFileSync(stateFile, 'utf8'));
+      }
+    } catch (_) { /* ignore */ }
+
+    const exists = state.leads.some(l => l.email === normalizedEmail);
+    if (!exists) {
+      state.leads.push({
+        email: normalizedEmail,
+        name: leadData.name,
+        company: leadData.company,
+        joinedAt: leadData.capturedAt,
+        currentStep: 0,
+        completedSteps: [],
+        lastSentAt: null
+      });
+      const dataDir = path.join(__dirname, 'data');
+      if (!require('fs').existsSync(dataDir)) {
+        require('fs').mkdirSync(dataDir, { recursive: true });
+      }
+      require('fs').writeFileSync(stateFile, JSON.stringify(state, null, 2));
+    }
+
+    // ウェルカムメール即時送信（ガイドDLリンク付き）
+    if (gmailTransporter) {
+      const displayName = leadData.name || '\u3054\u62C5\u5F53\u8005';
+      const unsubUrl = `https://stripe-discord-pro-417218426761.asia-northeast1.run.app/api/unsubscribe?email=${encodeURIComponent(normalizedEmail)}`;
+      const emailHtml = [
+        '<!DOCTYPE html><html><head><meta charset="utf-8"></head><body>',
+        '<div style="font-family:\'Helvetica Neue\',\'Hiragino Kaku Gothic ProN\',\'Hiragino Sans\',Meiryo,Arial,sans-serif;max-width:600px;margin:0 auto;color:#1a1a1a;">',
+        '<div style="background:#050505;padding:32px 24px;text-align:center;">',
+        '<div style="display:inline-block;background:#ff3300;color:#fff;font-weight:bold;font-size:18px;padding:8px 16px;letter-spacing:-0.5px;">AI</div>',
+        '<span style="color:#fff;font-weight:bold;font-size:14px;margin-left:12px;letter-spacing:1px;">ARCHI-CIRCLE</span>',
+        '</div>',
+        '<div style="padding:32px 24px;">',
+        `<p style="font-size:16px;line-height:1.8;">${displayName} \u69D8</p>`,
+        '<p style="font-size:15px;line-height:1.8;">',
+        'AI\u5EFA\u7BC9\u30B5\u30FC\u30AF\u30EB\u306E\u6AFB\u672C\u3067\u3059\u3002<br>',
+        '\u7121\u6599\u30AC\u30A4\u30C9\u306E\u30C0\u30A6\u30F3\u30ED\u30FC\u30C9\u30EA\u30AF\u30A8\u30B9\u30C8\u3001\u3042\u308A\u304C\u3068\u3046\u3054\u3056\u3044\u307E\u3059\u3002',
+        '</p>',
+        '<div style="background:#f8f8f8;border-left:4px solid #ff3300;padding:20px 24px;margin:24px 0;">',
+        '<p style="font-size:14px;font-weight:bold;margin:0 0 8px;">2025\u5E744\u6708\u65BD\u884C \u5EFA\u7BC9\u57FA\u6E96\u6CD5\u6539\u6B63 \u5B8C\u5168\u5BFE\u5FDC\u30AC\u30A4\u30C9</p>',
+        '<p style="font-size:13px;color:#666;margin:0;">4\u53F7\u7279\u4F8B\u7E2E\u5C0F\u30FB\u7701\u30A8\u30CD\u9069\u5408\u7FA9\u52D9\u5316\u306E\u5168\u8C8C\u3068\u3001AI\u3067\u5BFE\u5FDC\u30B3\u30B9\u30C8\u30921/10\u306B\u3059\u308B\u65B9\u6CD5</p>',
+        '</div>',
+        '<div style="text-align:center;margin:32px 0;">',
+        '<a href="https://ai-archi-circle.archi-prisma.co.jp/guide/" style="display:inline-block;background:#ff3300;color:#fff;font-weight:bold;font-size:15px;padding:14px 40px;text-decoration:none;border-radius:6px;">',
+        '\u30AC\u30A4\u30C9\u3092\u8AAD\u3080 \u2192',
+        '</a></div>',
+        '<hr style="border:none;border-top:1px solid #eee;margin:32px 0;">',
+        '<p style="font-size:14px;line-height:1.8;color:#444;">',
+        '<strong>\u3055\u3089\u306B\u8A73\u3057\u304F\u77E5\u308A\u305F\u3044\u65B9\u3078</strong><br>',
+        'AI\u5EFA\u7BC9\u30B5\u30FC\u30AF\u30EB\u3067\u306F\u3001\u6CD5\u6539\u6B63\u5BFE\u5FDC\u3060\u3051\u3067\u306A\u304F\u3001\u69CB\u9020\u8A08\u7B97\u30FB\u7701\u30A8\u30CD\u8A08\u7B97\u3092AI\u3067\u52B9\u7387\u5316\u3059\u308B\u30C4\u30FC\u30EB\u3068\u67082\u56DE\u306E\u30E9\u30A4\u30D6\u52C9\u5F37\u4F1A\u3067\u3001\u5EFA\u7BC9\u5B9F\u52D9\u3092\u5909\u3048\u308B\u30CE\u30A6\u30CF\u30A6\u3092\u63D0\u4F9B\u3057\u3066\u3044\u307E\u3059\u3002',
+        '</p>',
+        '<div style="text-align:center;margin:24px 0;">',
+        '<a href="https://ai-archi-circle.archi-prisma.co.jp/#pricing" style="display:inline-block;border:2px solid #ff3300;color:#ff3300;font-weight:bold;font-size:14px;padding:12px 32px;text-decoration:none;border-radius:6px;">',
+        '\u30B5\u30FC\u30AF\u30EB\u8A73\u7D30\u3092\u898B\u308B',
+        '</a></div>',
+        '<p style="font-size:12px;color:#999;margin-top:32px;line-height:1.6;">',
+        `\u3053\u306E\u30E1\u30FC\u30EB\u306F ${normalizedEmail} \u5B9B\u306B\u304A\u9001\u308A\u3057\u3066\u3044\u307E\u3059\u3002<br>`,
+        `<a href="${unsubUrl}" style="color:#999;text-decoration:underline;">\u914D\u4FE1\u505C\u6B62\u306F\u3053\u3061\u3089</a><br><br>`,
+        'AI Archi Circle / Archi-Prisma Design Works<br>',
+        '\u4EE3\u8868: \u6AFB\u672C\u8056\u6210',
+        '</p></div></div></body></html>'
+      ].join('\n');
+      try {
+        await gmailTransporter.sendMail({
+          from: '"AI Archi Circle" <' + process.env.GMAIL_USER + '>',
+          to: normalizedEmail,
+          subject: '\u30102025\u5E744\u6708\u65BD\u884C\u3011\u5EFA\u7BC9\u57FA\u6E96\u6CD5\u6539\u6B63 \u5B8C\u5168\u5BFE\u5FDC\u30AC\u30A4\u30C9',
+          textEncoding: 'base64',
+          html: emailHtml
+        });
+        console.log(`[capture] Welcome email sent to: ${normalizedEmail}`);
+      } catch (mailErr) {
+        console.error(`[capture] Failed to send welcome email to ${normalizedEmail}:`, mailErr.message);
+        // メール送信失敗してもリード登録自体は成功扱い
+      }
+    } else {
+      console.warn('[capture] Gmail transporter not configured – skipping welcome email');
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[capture] Error:', err);
+    res.status(500).json({ error: 'サーバーエラー' });
+  }
+});
+
+// ------- 配信停止 -------
+app.get('/api/unsubscribe', async (req, res) => {
+  const email = (req.query.email || '').trim().toLowerCase();
+  if (!email) return res.status(400).send('Invalid request');
+  try {
+    if (firestore) {
+      const snap = await firestore.collection('leads').where('email', '==', email).limit(1).get();
+      if (!snap.empty) {
+        await snap.docs[0].ref.update({ status: 'unsubscribed', unsubscribedAt: new Date().toISOString() });
+      }
+    }
+    const stateFile = path.join(__dirname, 'data', 'drip_state.json');
+    try {
+      const fs = require('fs');
+      if (fs.existsSync(stateFile)) {
+        const state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+        const lead = state.leads.find(l => l.email === email);
+        if (lead) { lead.completedSteps = [1,2,3,4,5,6,7]; lead.unsubscribed = true; }
+        fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
+      }
+    } catch (_) { /* ignore */ }
+    console.log(`[unsubscribe] ${email}`);
+    res.send('<!DOCTYPE html><html><head><meta charset="utf-8"></head><body style="font-family:sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;background:#fafafa;"><div style="text-align:center;"><h2>Unsubscribed</h2><p style="color:#666;margin-top:12px;">The email distribution has been stopped.</p></div></body></html>');
+  } catch (err) {
+    console.error('[unsubscribe] Error:', err);
+    res.status(500).send('Error');
+  }
+});
+
+// ------- ドリップキャンペーン自動実行（Cloud Scheduler用） -------
+app.post('/api/drip/run', async (req, res) => {
+  // Cloud Scheduler認証: OIDCトークン or シンプルなシークレットキー
+  const authHeader = req.headers['authorization'] || '';
+  const schedulerSecret = process.env.SCHEDULER_SECRET || '';
+  if (schedulerSecret && authHeader !== `Bearer ${schedulerSecret}`) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  try {
+    const drip = require('./drip_campaign');
+    await drip.processLeads();
+    res.json({ ok: true, message: 'Drip campaign processed' });
+  } catch (err) {
+    console.error('[drip/run] Error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/drip/status', async (req, res) => {
+  const authHeader = req.headers['authorization'] || '';
+  const schedulerSecret = process.env.SCHEDULER_SECRET || '';
+  if (schedulerSecret && authHeader !== `Bearer ${schedulerSecret}`) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  try {
+    const stateFile = path.join(__dirname, 'data', 'drip_state.json');
+    const fs = require('fs');
+    if (!fs.existsSync(stateFile)) return res.json({ leads: 0, lastProcessed: null });
+    const state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    res.json({
+      leads: state.leads.length,
+      lastProcessed: state.lastProcessed || null,
+      summary: state.leads.map(l => ({
+        email: l.email,
+        step: (l.completedSteps || []).length,
+        total: 7
+      }))
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ------- 紹介リンク取得ページ -------
+app.get('/referral', (_req, res) => {
+  const html = `
+<!doctype html><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>紹介プログラム - AI×建築サークル</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: system-ui, -apple-system, "Noto Sans JP", sans-serif; background: #f8f9fa; min-height: 100vh; display: flex; align-items: center; justify-content: center; color: #333; }
+  .container { max-width: 500px; width: 100%; text-align: center; padding: 48px 24px; background: white; border-radius: 8px; border: 1px solid #e9ecef; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+  h1 { font-size: 1.8rem; margin-bottom: 8px; }
+  .subtitle { color: #666; margin-bottom: 32px; font-size: 0.95rem; }
+  .reward-box { background: #e8f5e9; border: 1px solid #66bb6a; border-radius: 8px; padding: 16px; margin-bottom: 24px; }
+  .reward-box strong { color: #2e7d32; }
+  input { width: 100%; padding: 12px 16px; border-radius: 4px; border: 1px solid #e9ecef; font-size: 1rem; margin-bottom: 12px; }
+  .btn { display: inline-block; padding: 14px 28px; background: #333; color: #fff; border: none; border-radius: 4px; font-size: 1rem; font-weight: 500; cursor: pointer; width: 100%; }
+  .btn:hover { background: #000; }
+  .btn:disabled { opacity: 0.5; }
+  .result { display: none; margin-top: 24px; text-align: left; }
+  .link-box { background: #f5f5f5; border: 1px solid #ddd; border-radius: 6px; padding: 12px; margin: 12px 0; word-break: break-all; font-family: monospace; font-size: 0.85rem; }
+  .copy-btn { padding: 8px 16px; background: #1976d2; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 0.85rem; margin-top: 8px; }
+  .copy-btn:hover { background: #1565c0; }
+  .stats { display: flex; gap: 16px; margin-top: 16px; }
+  .stat { flex: 1; background: #f8f9fa; border-radius: 6px; padding: 12px; text-align: center; }
+  .stat-num { font-size: 1.5rem; font-weight: bold; color: #333; }
+  .stat-label { font-size: 0.75rem; color: #888; }
+  .error { color: #dc3545; margin-top: 8px; display: none; }
+  a.back { display: inline-block; margin-top: 24px; color: #666; text-decoration: none; font-size: 0.9rem; }
+</style>
+<div class="container">
+  <h1>紹介プログラム</h1>
+  <p class="subtitle">仲間を紹介して、お互いに初月¥1,000 OFF</p>
+
+  <div class="reward-box">
+    <strong>紹介者特典</strong>: 紹介成功で次月¥1,000 OFF<br>
+    <strong>新規入会者特典</strong>: 初月¥1,000 OFF
+  </div>
+
+  <div id="form-section">
+    <input type="email" id="ref-email" placeholder="登録メールアドレス" required>
+    <button class="btn" id="generate-btn" onclick="generateLink()">紹介リンクを取得</button>
+    <p class="error" id="ref-error"></p>
+  </div>
+
+  <div class="result" id="result-section">
+    <p style="font-weight:600; margin-bottom:8px;">あなたの紹介リンク:</p>
+    <div class="link-box" id="ref-link"></div>
+    <button class="copy-btn" onclick="copyLink()">コピーする</button>
+    <div class="stats">
+      <div class="stat">
+        <div class="stat-num" id="ref-count">0</div>
+        <div class="stat-label">紹介成功</div>
+      </div>
+      <div class="stat">
+        <div class="stat-num" id="ref-code-display">-</div>
+        <div class="stat-label">コード</div>
+      </div>
+    </div>
+    <p style="margin-top:16px; font-size:0.85rem; color:#666;">このリンクをSNSやメールで共有してください。リンク経由で入会した方に自動で割引が適用されます。</p>
+  </div>
+
+  <a class="back" href="/">← トップへ戻る</a>
+</div>
+<script>
+  async function generateLink() {
+    const email = document.getElementById('ref-email').value;
+    const btn = document.getElementById('generate-btn');
+    const errDiv = document.getElementById('ref-error');
+    errDiv.style.display = 'none';
+    btn.disabled = true;
+    btn.textContent = '取得中...';
+
+    try {
+      const resp = await fetch('/api/referral/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email })
+      });
+      const data = await resp.json();
+
+      if (!resp.ok) {
+        errDiv.textContent = data.error || 'エラーが発生しました';
+        errDiv.style.display = 'block';
+        btn.disabled = false;
+        btn.textContent = '紹介リンクを取得';
+        return;
+      }
+
+      document.getElementById('ref-link').textContent = data.link;
+      document.getElementById('ref-count').textContent = data.referrals || 0;
+      document.getElementById('ref-code-display').textContent = data.code;
+      document.getElementById('form-section').style.display = 'none';
+      document.getElementById('result-section').style.display = 'block';
+    } catch {
+      errDiv.textContent = 'ネットワークエラー';
+      errDiv.style.display = 'block';
+      btn.disabled = false;
+      btn.textContent = '紹介リンクを取得';
+    }
+  }
+
+  function copyLink() {
+    const link = document.getElementById('ref-link').textContent;
+    navigator.clipboard.writeText(link).then(() => {
+      const btn = document.querySelector('.copy-btn');
+      btn.textContent = 'コピーしました！';
+      setTimeout(() => btn.textContent = 'コピーする', 2000);
+    });
+  }
+</script>
+  `;
+  res.type('html').send(html);
+});
+
+// ------- リファラル（会員紹介）API -------
+app.post('/api/referral/generate', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'メールアドレスは必須です' });
+
+    const normalizedEmail = email.trim().toLowerCase();
+
+    // 既存会員か確認（Stripeで検索）
+    const customers = await stripe.customers.list({ email: normalizedEmail, limit: 1 });
+    if (customers.data.length === 0) {
+      return res.status(404).json({ error: '会員が見つかりません' });
+    }
+    const customer = customers.data[0];
+
+    // 既にリファラルコードがあるか確認
+    if (firestore) {
+      const existingRef = await firestore.collection('referrals')
+        .where('referrerEmail', '==', normalizedEmail).limit(1).get();
+
+      if (!existingRef.empty) {
+        const existing = existingRef.docs[0].data();
+        return res.json({
+          ok: true,
+          code: existing.code,
+          referrals: existing.referrals || 0,
+          link: `${req.protocol}://${req.get('host')}/?ref=${existing.code}`
+        });
+      }
+    }
+
+    // 新規リファラルコード生成
+    const code = `REF-${customer.name ? customer.name.replace(/\s/g, '').slice(0, 4).toUpperCase() : 'ARCHI'}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+
+    // Stripeクーポン作成（紹介者特典：次月1,000円OFF）
+    let couponId = null;
+    try {
+      const coupon = await stripe.coupons.create({
+        amount_off: 1000,
+        currency: 'jpy',
+        duration: 'once',
+        name: `紹介特典 (${code})`,
+        metadata: { referral_code: code, referrer_email: normalizedEmail }
+      });
+      couponId = coupon.id;
+    } catch (err) {
+      console.warn('[referral] Coupon creation failed:', err.message);
+    }
+
+    // Firestore保存
+    if (firestore) {
+      await firestore.collection('referrals').add({
+        referrerEmail: normalizedEmail,
+        referrerCustomerId: customer.id,
+        code,
+        couponId,
+        referrals: 0,
+        rewardsClaimed: 0,
+        createdAt: new Date().toISOString()
+      });
+    }
+
+    console.log(`[referral] Generated code ${code} for ${normalizedEmail}`);
+    res.json({
+      ok: true,
+      code,
+      referrals: 0,
+      link: `${req.protocol}://${req.get('host')}/?ref=${code}`
+    });
+  } catch (err) {
+    console.error('[referral] Error:', err);
+    res.status(500).json({ error: 'サーバーエラー' });
+  }
+});
+
+// リファラルコード検証（入会時に使用）
+app.get('/api/referral/verify/:code', async (req, res) => {
+  try {
+    const { code } = req.params;
+    if (!firestore) return res.status(500).json({ error: 'DB未初期化' });
+
+    const snap = await firestore.collection('referrals')
+      .where('code', '==', code).limit(1).get();
+
+    if (snap.empty) {
+      return res.status(404).json({ error: '無効なコードです' });
+    }
+
+    const ref = snap.docs[0];
+    const data = ref.data();
+
+    res.json({
+      ok: true,
+      valid: true,
+      couponId: data.couponId,
+      referrerName: data.referrerEmail.split('@')[0]
+    });
+  } catch (err) {
+    console.error('[referral/verify] Error:', err);
+    res.status(500).json({ error: 'サーバーエラー' });
+  }
+});
+
+// リファラル成功時（新規入会完了後に呼ぶ）
+app.post('/api/referral/complete', async (req, res) => {
+  try {
+    const { code, newMemberEmail } = req.body;
+    if (!code || !newMemberEmail || !firestore) {
+      return res.status(400).json({ error: 'パラメータ不足' });
+    }
+
+    const snap = await firestore.collection('referrals')
+      .where('code', '==', code).limit(1).get();
+
+    if (snap.empty) {
+      return res.status(404).json({ error: '無効なコードです' });
+    }
+
+    const ref = snap.docs[0];
+    const data = ref.data();
+
+    // 紹介数をインクリメント
+    await ref.ref.update({
+      referrals: (data.referrals || 0) + 1,
+      lastReferralAt: new Date().toISOString()
+    });
+
+    // 紹介者にクーポン適用（Stripeのサブスクに次回割引）
+    if (data.couponId && data.referrerCustomerId) {
+      try {
+        const subs = await stripe.subscriptions.list({
+          customer: data.referrerCustomerId,
+          status: 'active',
+          limit: 1
+        });
+        if (subs.data.length > 0) {
+          await stripe.subscriptions.update(subs.data[0].id, {
+            coupon: data.couponId
+          });
+          console.log(`[referral] Applied coupon to ${data.referrerEmail}`);
+        }
+      } catch (err) {
+        console.warn('[referral] Coupon apply failed:', err.message);
+      }
+    }
+
+    console.log(`[referral] Completed: ${code} → ${newMemberEmail}`);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[referral/complete] Error:', err);
+    res.status(500).json({ error: 'サーバーエラー' });
+  }
+});
+
+// ------- 公開メンバー数API -------
+app.get('/api/stats', async (_req, res) => {
+  try {
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Cache-Control', 'public, max-age=3600'); // 1時間キャッシュ
+
+    const subs = await stripe.subscriptions.list({ status: 'active', limit: 100 });
+    const activeCount = subs.data.filter(sub =>
+      sub.items.data.some(item => ENTITLED_PRICE_IDS.has(item.price.id))
+    ).length;
+
+    res.json({ members: activeCount, updatedAt: new Date().toISOString() });
+  } catch (err) {
+    console.error('[stats] Error:', err.message);
+    res.json({ members: 28, updatedAt: new Date().toISOString() }); // fallback
+  }
+});
+
+// ------- 既存月額会員への年間プラン案内メール送信 -------
+app.post('/admin/send-annual-upgrade', async (req, res) => {
+  const authHeader = req.headers.authorization || '';
+  if (authHeader !== `Bearer ${CFG.SCHEDULER_TOKEN}`) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  if (!gmailTransporter) {
+    return res.status(500).json({ error: 'Gmail transporter not configured' });
+  }
+
+  try {
+    // アクティブな月額サブスクリプションの顧客を取得
+    const subs = [];
+    let hasMore = true;
+    let startingAfter;
+    while (hasMore) {
+      const params = { status: 'active', limit: 100 };
+      if (startingAfter) params.starting_after = startingAfter;
+      const batch = await stripe.subscriptions.list(params);
+      subs.push(...batch.data);
+      hasMore = batch.has_more;
+      if (batch.data.length > 0) startingAfter = batch.data[batch.data.length - 1].id;
+    }
+
+    // 月額プランの会員のみフィルタ（年額は除外）
+    const monthlyPriceId = PRICE_IDS.monthly;
+    const studentPriceId = PRICE_IDS.student;
+    const yearlyPriceId = PRICE_IDS.yearly;
+
+    const monthlySubs = subs.filter(sub => {
+      const priceIds = sub.items.data.map(item => item.price.id);
+      return priceIds.includes(monthlyPriceId) || priceIds.includes(studentPriceId);
+    });
+
+    const base = 'https://stripe-discord-pro-417218426761.asia-northeast1.run.app';
+    let sent = 0;
+    let errors = 0;
+
+    for (const sub of monthlySubs) {
+      const customer = await stripe.customers.retrieve(sub.customer);
+      if (!customer.email) continue;
+
+      const emailHtml = [
+        '<!DOCTYPE html><html><head><meta charset="utf-8"></head><body>',
+        '<div style="font-family:\'Helvetica Neue\',\'Hiragino Kaku Gothic ProN\',\'Hiragino Sans\',Meiryo,Arial,sans-serif;max-width:600px;margin:0 auto;color:#1a1a1a;">',
+        '<div style="background:#050505;padding:32px 24px;text-align:center;">',
+        '<div style="display:inline-block;background:#ff3300;color:#fff;font-weight:bold;font-size:18px;padding:8px 16px;letter-spacing:-0.5px;">AI</div>',
+        '<span style="color:#fff;font-weight:bold;font-size:14px;margin-left:12px;letter-spacing:1px;">ARCHI-CIRCLE</span>',
+        '</div>',
+        '<div style="padding:32px 24px;">',
+        `<p style="font-size:16px;line-height:1.8;">${customer.name || '\u3054\u62C5\u5F53\u8005'}\u69D8</p>`,
+        '<p style="font-size:15px;line-height:1.8;">',
+        '\u3044\u3064\u3082AI\u5EFA\u7BC9\u30B5\u30FC\u30AF\u30EB\u3092\u3054\u5229\u7528\u3044\u305F\u3060\u304D\u3042\u308A\u304C\u3068\u3046\u3054\u3056\u3044\u307E\u3059\u3002<br>\u6AFB\u672C\u3067\u3059\u3002',
+        '</p>',
+        '<p style="font-size:15px;line-height:1.8;">',
+        '\u4F1A\u54E1\u306E\u7686\u3055\u307E\u304B\u3089\u306E\u3054\u8981\u671B\u3092\u53D7\u3051\u3001<strong>\u5E74\u9593\u30D7\u30E9\u30F3</strong>\u3092\u3054\u7528\u610F\u3057\u307E\u3057\u305F\u3002',
+        '</p>',
+        '<div style="background:#f8f8f8;border:2px solid #ff3300;border-radius:8px;padding:24px;margin:24px 0;text-align:center;">',
+        '<p style="font-size:13px;color:#ff3300;font-weight:bold;margin:0 0 8px;letter-spacing:1px;">\u5E74\u9593\u30D7\u30E9\u30F3</p>',
+        '<p style="font-size:36px;font-weight:800;margin:0;line-height:1;">&yen;50,000<span style="font-size:14px;color:#666;font-weight:normal;"> / \u5E74\uFF08\u7A0E\u8FBC\uFF09</span></p>',
+        '<p style="font-size:14px;color:#ff3300;font-weight:600;margin:8px 0 0;">\u6708\u3042\u305F\u308A\u7D04&yen;4,167 \u2015 \u5E74\u9593&yen;10,000\u304A\u5F97</p>',
+        '</div>',
+        '<table style="width:100%;border-collapse:collapse;margin:20px 0;font-size:14px;">',
+        '<tr style="border-bottom:1px solid #eee;">',
+        '<td style="padding:10px 0;color:#666;">\u73FE\u5728\u306E\u6708\u984D\u30D7\u30E9\u30F3</td>',
+        '<td style="padding:10px 0;text-align:right;font-weight:600;">&yen;5,000 \u00D7 12\u30F6\u6708 = <span style="color:#999;text-decoration:line-through;">&yen;60,000</span></td>',
+        '</tr>',
+        '<tr>',
+        '<td style="padding:10px 0;color:#666;">\u5E74\u9593\u30D7\u30E9\u30F3</td>',
+        '<td style="padding:10px 0;text-align:right;font-weight:700;color:#ff3300;">&yen;50,000\uFF08&yen;10,000\u304A\u5F97\uFF09</td>',
+        '</tr>',
+        '</table>',
+        '<p style="font-size:14px;line-height:1.8;color:#444;">',
+        '\u5207\u308A\u66FF\u3048\u306F\u4EFB\u610F\u3067\u3059\u3002\u73FE\u5728\u306E\u6708\u984D\u30D7\u30E9\u30F3\u3082\u5F15\u304D\u7D9A\u304D\u3054\u5229\u7528\u3044\u305F\u3060\u3051\u307E\u3059\u3002<br>',
+        '\u5207\u308A\u66FF\u3048\u3092\u3054\u5E0C\u671B\u306E\u65B9\u306F\u3001\u4E0B\u306E\u30DC\u30BF\u30F3\u304B\u3089\u304A\u624B\u7D9A\u304D\u304F\u3060\u3055\u3044\u3002',
+        '</p>',
+        '<div style="text-align:center;margin:28px 0;">',
+        `<a href="${base}/?plan=yearly" style="display:inline-block;background:#ff3300;color:#fff;font-weight:bold;font-size:15px;padding:14px 40px;text-decoration:none;border-radius:6px;">`,
+        '\u5E74\u9593\u30D7\u30E9\u30F3\u306B\u5207\u308A\u66FF\u3048\u308B \u2192',
+        '</a></div>',
+        '<p style="font-size:12px;color:#999;margin-top:32px;line-height:1.6;">',
+        '\u203B \u73FE\u5728\u306E\u30B5\u30D6\u30B9\u30AF\u30EA\u30D7\u30B7\u30E7\u30F3\u306F\u8ACB\u6C42\u7BA1\u7406\u30DA\u30FC\u30B8\u304B\u3089\u89E3\u7D04\u3067\u304D\u307E\u3059\u3002<br>',
+        '\u5E74\u9593\u30D7\u30E9\u30F3\u3078\u306E\u5207\u308A\u66FF\u3048\u5F8C\u3001\u65E7\u30D7\u30E9\u30F3\u306F\u81EA\u52D5\u7684\u306B\u7D42\u4E86\u3057\u307E\u3059\u3002<br><br>',
+        'AI Archi Circle / Archi-Prisma Design Works<br>',
+        '\u4EE3\u8868: \u6AFB\u672C\u8056\u6210',
+        '</p></div></div></body></html>'
+      ].join('\n');
+
+      try {
+        await gmailTransporter.sendMail({
+          from: '"AI Archi Circle" <' + process.env.GMAIL_USER + '>',
+          to: customer.email,
+          subject: '\u3010\u4F1A\u54E1\u9650\u5B9A\u3011\u5E74\u9593\u30D7\u30E9\u30F3\u304C\u767B\u5834 \u2015 \u5E74\u9593\uFFE510,000\u304A\u5F97\u306B',
+          textEncoding: 'base64',
+          html: emailHtml
+        });
+        sent++;
+        console.log(`[annual-upgrade] Email sent to: ${customer.email}`);
+      } catch (mailErr) {
+        errors++;
+        console.error(`[annual-upgrade] Failed: ${customer.email}:`, mailErr.message);
+      }
+    }
+
+    res.json({ ok: true, totalMonthly: monthlySubs.length, sent, errors });
+  } catch (err) {
+    console.error('[annual-upgrade] Error:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ------- サーバ起動 -------
